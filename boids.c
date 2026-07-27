@@ -36,55 +36,47 @@ float rand_range(float a, float b){
     return a + (rand() / (float)RAND_MAX) * (b-a);
 }
 
+// aplica el teletransporte a la dimension recibida
+void boid_apply_dimension_wrap(float *position, float limit){
+    if (*position > limit) {
+        //se le resta el tamaño del mapa *2 a la posicion para aparecer en el otro lado
+        *position -= limit * 2.0f;
+    } else if (*position < -limit) {
+        *position += limit * 2.0f;
+    }
+}
+
+// aplica los rebotes de la dimension que reciba
+void boid_apply_dimension_bounce(float *position, float *velocity, float limit){
+    if (*position > limit) {
+        //resta el tamaño del mapa*2 - la posicion para continuar con excesos, ej: 10.2 pasa a ser 9.8 si el mapa es de 10, evitando la perdida de esos 0.2
+        *position = 2.0f * limit - *position;
+        //se invierte la velocidad
+        *velocity = -*velocity;
+    } else if (*position < -limit) {
+        *position = -2.0f * limit - *position;
+        *velocity = -*velocity;
+    }
+}
+
+// aplica los teletransportes/rebotes en base al tipo elegido
 void boid_apply_boundary(boid *b, const config *cfg){
+    float limit = cfg->world_size;
+
     if (cfg->boundary_mode == BOUNDARY_WRAP){
         // teletransporte en x
-        if (b->position.x > cfg->world_size){
-            b->position.x -= cfg->world_size * 2.0f;
-        } else if (b->position.x < -(cfg->world_size)){
-            b->position.x += cfg->world_size * 2.0f;
-        }
-
+        boid_apply_dimension_wrap(&b->position.x, limit);
         // teletransporte en y
-        if (b->position.y > cfg->world_size){
-            b->position.y -= cfg->world_size * 2.0f;
-        } else if (b->position.y < -(cfg->world_size)){
-            b->position.y += cfg->world_size * 2.0f;
-        }
-
+        boid_apply_dimension_wrap(&b->position.y, limit);
         // teletransporte en z
-        if (b->position.z > cfg->world_size){
-            b->position.z -= cfg->world_size * 2.0f;
-        } else if (b->position.z < -(cfg->world_size)){
-            b->position.z += cfg->world_size * 2.0f;
-        }
+        boid_apply_dimension_wrap(&b->position.z, limit);
     } else {
         // rebote en x
-        if (b->position.x > cfg->world_size){
-            b->position.x = 2.0f * cfg->world_size - b->position.x;
-            b->velocity.x = -b->velocity.x;
-        } else if (b->position.x < -(cfg->world_size)){
-            b->position.x = -2.0f * cfg->world_size - b->position.x;
-            b->velocity.x = -b->velocity.x;
-        }
-
-        // rebote en y
-        if (b->position.y > cfg->world_size){
-            b->position.y = 2.0f * cfg->world_size - b->position.y;
-            b->velocity.y = -b->velocity.y;
-        } else if (b->position.y < -(cfg->world_size)){
-            b->position.y = -2.0f * cfg->world_size - b->position.y;
-            b->velocity.y = -b->velocity.y;
-        }
-
-        // rebote en z
-        if (b->position.z > cfg->world_size){
-            b->position.z = 2.0f * cfg->world_size - b->position.z;
-            b->velocity.z = -b->velocity.z;
-        } else if (b->position.z < -(cfg->world_size)){
-            b->position.z = -2.0f * cfg->world_size - b->position.z;
-            b->velocity.z = -b->velocity.z;
-        }
+        boid_apply_dimension_bounce(&b->position.x, &b->velocity.x, limit);
+        // rebote en x
+        boid_apply_dimension_bounce(&b->position.y, &b->velocity.y, limit);
+        // rebote en x
+        boid_apply_dimension_bounce(&b->position.z, &b->velocity.z, limit);
     }
 }
 
