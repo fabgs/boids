@@ -36,6 +36,17 @@ float rand_range(float a, float b){
     return a + (rand() / (float)RAND_MAX) * (b-a);
 }
 
+// para cambiar el comportamiento con respecto a los limites
+void simulation_handle_input(config *cfg) {
+    if (IsKeyPressed(KEY_B)) {
+        if (cfg->boundary_mode == BOUNDARY_BOUNCE) {
+            cfg->boundary_mode = BOUNDARY_WRAP;
+        } else {
+            cfg->boundary_mode = BOUNDARY_BOUNCE;
+        }
+    }
+}
+
 // aplica el teletransporte a la dimension recibida
 void boid_apply_dimension_wrap(float *position, float limit){
     if (*position > limit) {
@@ -136,7 +147,7 @@ void boids_update(boid *boids, const config *cfg, float dt){
 
 int main() {
     config cfg = {
-        .num_boids = 50,
+        .num_boids = 500,
         .min_speed = 1.0f,
         .max_speed = 5.0f,
         .vision_radius = 10.0f,
@@ -164,7 +175,7 @@ int main() {
     DisableCursor();
 
     Camera3D camera = {0};
-    camera.position = (Vector3){cfg.world_size*2.0f, cfg.world_size*2.0f, cfg.world_size*2.0f};
+    camera.position = (Vector3){cfg.world_size+10.0f, cfg.world_size+10.0f, cfg.world_size+10.0f};
     camera.target = (Vector3){0.0f, 0.0f, 0.0f};
     camera.up = (Vector3){0.0f, 1.0f, 0.0f};
     camera.fovy = 45.0f;
@@ -173,6 +184,7 @@ int main() {
     while (!WindowShouldClose()) {
         float dt = GetFrameTime();
 
+        simulation_handle_input(&cfg);
         UpdateCamera(&camera, CAMERA_FREE);
         boids_update(boids, &cfg, dt);
 
