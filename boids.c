@@ -26,9 +26,9 @@ typedef struct{
     float cos_blind_angle; // coseno del ángulo muerto trasero de visión de los boids
     //float max_force; // fuerza máxima de aceleración de los boids
     float world_size; // tamaño del mundo en el que se mueven los boids
-    //float separation_weight; // peso de la fuerza de separación
-    //float alignment_weight; // peso de la fuerza de alineación
-    //float cohesion_weight; // peso de la fuerza de cohesión
+    float separation_weight; // peso de la fuerza de separación
+    float alignment_weight; // peso de la fuerza de alineación
+    float cohesion_weight; // peso de la fuerza de cohesión
     boundary_mode boundary_mode;
 } config;
 
@@ -190,10 +190,17 @@ void boids_update(boid *boids, const config *cfg, float dt){
 
 void boids_compute_accelerations(boid *boids, const config *cfg) {
     for (int i = 0; i < cfg->num_boids; i++) {
+        //recorro todos los boids, me marco el de referencia
         boid *observer = &boids[i];
 
         int neighbor_count = 0;
 
+        //vectores para acumular las 3 reglas
+        vec3 separation = {0, 0, 0};
+        vec3 alignment = {0, 0, 0};
+        vec3 cohesion = {0, 0, 0};
+
+        //recorro de nuevo todos los boids, para ver cuales son vecinos del referente
         for (int j = 0; j < cfg->num_boids; j++) {
             if (i == j) {
                 continue;
@@ -205,22 +212,56 @@ void boids_compute_accelerations(boid *boids, const config *cfg) {
                 continue;
             }
 
-            neighbor_count++;
+            //separacion
+            vec3 vector_huida = boids_offset(other, observer, cfg); 
+            float distance = sqrtf(vec3_length2(vector_huida));
 
-            //aplicar reglas
+            if (distance > 0.001f) { // Evitar divisiones por cero
+                // cuanto más cerca, más fuerte es el rechazo
+                vec3 push_force = vec3_scale(vector_huida, 1.0f / distance);
+                separation = vec3_add(separation, push_force);
+            }
+
+            //alineacion
+            alignment = vec3_add(alignment, other->velocity);
+
+            //cohesion
+            vec3 vector_acercar = boids_offset(observer, other, cfg);
+            cohesion = vec3_add(cohesion, vector_acercar);
+
+            neighbor_count++;
+        }
+
+        if (neighbor_count > 0){
+            //promediar las fuerzas
+            alignment = vec3_scale(alignment, 1.0f / neighbor_count);
+            cohesion = vec3_scale(cohesion, 1.0f / neighbor_count);
+
+            //aplicar pesos
+            vec3 sep_force = vec3_scale(separation, cfg->separation_weight);
+            vec3 ali_force = vec3_scale(alignment, cfg->alignment_weight);
+            vec3 coh_force = vec3_scale(cohesion, cfg->cohesion_weight);
+
+            //sumo las fuerzas a la aceleración
+            observer->acceleration = vec3_add(observer->acceleration, sep_force);
+            observer->acceleration = vec3_add(observer->acceleration, ali_force);
+            observer->acceleration = vec3_add(observer->acceleration, coh_force);
         }
     }
 }
 
 int main() {
     config cfg = {
-        .num_boids = 50,
+        .num_boids = 1000,
         .min_speed = 1.0f,
         .max_speed = 5.0f,
-        .vision_radius = 3.0f,
+        .vision_radius = 10.0f,
         .blind_angle = 1.0f, //radianes (aprox 57 grados)
         .cos_blind_angle = 0.0f, // pendiente: precalcular con cosf(blind_angle)
-        .world_size = 10,
+        .world_size = 100,
+        .separation_weight = 0.3f,
+        .alignment_weight = 0.3f,
+        .cohesion_weight = 0.3f,
         .boundary_mode = BOUNDARY_BOUNCE,
     };
 
