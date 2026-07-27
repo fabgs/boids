@@ -3,6 +3,11 @@
 #include "vec3.h"
 #include "raylib.h"
 
+typedef enum {
+    BOUNDARY_BOUNCE,
+    BOUNDARY_WRAP
+} boundary_mode;
+
 // estructura que representa un boid, posición, velocidad y aceleración
 typedef struct {
     vec3 position;
@@ -23,11 +28,64 @@ typedef struct{
     //float separation_weight; // peso de la fuerza de separación
     //float alignment_weight; // peso de la fuerza de alineación
     //float cohesion_weight; // peso de la fuerza de cohesión
+    boundary_mode boundary_mode;
 } config;
 
 // genera un float aleatorio entre dos valores
 float rand_range(float a, float b){
     return a + (rand() / (float)RAND_MAX) * (b-a);
+}
+
+void boid_apply_boundary(boid *b, const config *cfg){
+    if (cfg->boundary_mode == BOUNDARY_WRAP){
+        // teletransporte en x
+        if (b->position.x > cfg->world_size){
+            b->position.x -= cfg->world_size * 2.0f;
+        } else if (b->position.x < -(cfg->world_size)){
+            b->position.x += cfg->world_size * 2.0f;
+        }
+
+        // teletransporte en y
+        if (b->position.y > cfg->world_size){
+            b->position.y -= cfg->world_size * 2.0f;
+        } else if (b->position.y < -(cfg->world_size)){
+            b->position.y += cfg->world_size * 2.0f;
+        }
+
+        // teletransporte en z
+        if (b->position.z > cfg->world_size){
+            b->position.z -= cfg->world_size * 2.0f;
+        } else if (b->position.z < -(cfg->world_size)){
+            b->position.z += cfg->world_size * 2.0f;
+        }
+    } else {
+        // rebote en x
+        if (b->position.x > cfg->world_size){
+            b->position.x = 2.0f * cfg->world_size - b->position.x;
+            b->velocity.x = -b->velocity.x;
+        } else if (b->position.x < -(cfg->world_size)){
+            b->position.x = -2.0f * cfg->world_size - b->position.x;
+            b->velocity.x = -b->velocity.x;
+        }
+
+        // rebote en y
+        if (b->position.y > cfg->world_size){
+            b->position.y = 2.0f * cfg->world_size - b->position.y;
+            b->velocity.y = -b->velocity.y;
+        } else if (b->position.y < -(cfg->world_size)){
+            b->position.y = -2.0f * cfg->world_size - b->position.y;
+            b->velocity.y = -b->velocity.y;
+        }
+
+        // rebote en z
+        if (b->position.z > cfg->world_size){
+            b->position.z = 2.0f * cfg->world_size - b->position.z;
+            b->velocity.z = -b->velocity.z;
+        } else if (b->position.z < -(cfg->world_size)){
+            b->position.z = -2.0f * cfg->world_size - b->position.z;
+            b->velocity.z = -b->velocity.z;
+        }
+    }
 }
 
 // inicializa la posición, velocidad y aceleración de los boids
@@ -77,6 +135,8 @@ void boids_update(boid *boids, const config *cfg, float dt){
         //la velocidad hace que cambie la posición
         b->position = vec3_add(b->position, vec3_scale(b->velocity, dt));
 
+        boid_apply_boundary(b, cfg);
+
         //vaciar aceleracion acumulada para el siguiente frame
         b->acceleration = (vec3){0,0,0};
     }
@@ -91,6 +151,7 @@ int main() {
         .blind_angle = 1.0f, //radianes (aprox 57 grados)
         .cos_blind_angle = 0.0f, // pendiente: precalcular con cosf(blind_angle)
         .world_size = 10,
+        .boundary_mode = BOUNDARY_BOUNCE,
     };
 
     // semilla aleatoria
@@ -111,11 +172,11 @@ int main() {
     DisableCursor();
 
     Camera3D camera = {0};
-    camera.position = (Vector3){20.0f, 20.0f, 20.0f};
+    camera.position = (Vector3){cfg.world_size*2.0f, cfg.world_size*2.0f, cfg.world_size*2.0f};
     camera.target = (Vector3){0.0f, 0.0f, 0.0f};
     camera.up = (Vector3){0.0f, 1.0f, 0.0f};
     camera.fovy = 45.0f;
-    camera.projection = CAMERA_PERSPECTIVE;
+    camera.projection = CAMERA_PERSPECTIVE; 
 
     while (!WindowShouldClose()) {
         float dt = GetFrameTime();
@@ -155,7 +216,12 @@ int main() {
                 b->position.z + direction.z * half_length
             };
 
-            DrawCylinderEx(base, tip, 0.18f, 0.0f, 8, SKYBLUE);
+            // pinto uno de amarillo para poder seguirlo
+            if (i == 0){
+                DrawCylinderEx(base, tip, 0.18f, 0.0f, 8, YELLOW);
+            } else {
+                DrawCylinderEx(base, tip, 0.18f, 0.0f, 8, SKYBLUE);
+            }
         }
 
         EndMode3D();
