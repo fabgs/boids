@@ -16,6 +16,16 @@ typedef struct {
     vec3 acceleration;
 } boid;
 
+// grid espacial para reducir las comparaciones entre boids
+typedef struct {
+    int *head; //array del tamaño del número total de celdas
+    int *next; //array del tamaño de num_boids
+    int cells_x, cells_y, cells_z; //celdas por eje
+    int total_cells;
+    float cell_size;
+    float world_offset; // pasar de -mundo, +mundo a 0, mundo*2
+} spatial_grid;
+
 // estructura que representa la configuración para el sistema de boids
 typedef struct{
     int num_boids;
@@ -188,61 +198,93 @@ void boids_update(boid *boids, const config *cfg, float dt){
     }
 }
 
-void boids_compute_accelerations(boid *boids, const config *cfg) {
+// calcula las aceleraciones en base a las reglas de reynolds
+void boids_compute_accelerations(boid *boids, const config *cfg, const spatial_grid *g) {
     for (int i = 0; i < cfg->num_boids; i++) {
-        //recorro todos los boids, me marco el de referencia
         boid *observer = &boids[i];
-
         int neighbor_count = 0;
 
-        //vectores para acumular las 3 reglas
         vec3 separation = {0, 0, 0};
         vec3 alignment = {0, 0, 0};
         vec3 cohesion = {0, 0, 0};
 
-        //recorro de nuevo todos los boids, para ver cuales son vecinos del referente
-        for (int j = 0; j < cfg->num_boids; j++) {
-            if (i == j) {
-                continue;
+        //calcular en qué celda está el boid observador
+        int cx = (int)((observer->position.x + g->world_offset) / g->cell_size);
+        int cy = (int)((observer->position.y + g->world_offset) / g->cell_size);
+        int cz = (int)((observer->position.z + g->world_offset) / g->cell_size);
+        
+        //clampear para no salirnos del grid
+        if (cx < 0) cx = 0; else if (cx >= g->cells_x) cx = g->cells_x - 1;
+        if (cy < 0) cy = 0; else if (cy >= g->cells_y) cy = g->cells_y - 1;
+        if (cz < 0) cz = 0; else if (cz >= g->cells_z) cz = g->cells_z - 1;
+
+        //buscar en la propia celda y en las 26 vecinas
+        for (int dx = -1; dx <= 1; dx++) {
+            for (int dy = -1; dy <= 1; dy++) {
+                for (int dz = -1; dz <= 1; dz++) {
+                    int nx = cx + dx;
+                    int ny = cy + dy;
+                    int nz = cz + dz;
+
+                    //gestionar los límites según el boundary_mode
+                    if (cfg->boundary_mode == BOUNDARY_WRAP) {
+                        // Si nos salimos por la derecha, miramos por la izquierda
+                        if (nx < 0) nx += g->cells_x; else if (nx >= g->cells_x) nx -= g->cells_x;
+                        if (ny < 0) ny += g->cells_y; else if (ny >= g->cells_y) ny -= g->cells_y;
+                        if (nz < 0) nz += g->cells_z; else if (nz >= g->cells_z) nz -= g->cells_z;
+                    } else {
+                        //en modo rebote, las celdas fuera del mapa no existen
+                        if (nx < 0 || nx >= g->cells_x || ny < 0 || ny >= g->cells_y || nz < 0 || nz >= g->cells_z) {
+                            continue;
+                        }
+                    }
+
+                    //calcular índice 1D de esta celda vecina
+                    int cell_idx = nx + ny * g->cells_x + nz * g->cells_x * g->cells_y;
+                    
+                    //recorrer los boids que están en esta celda vecina
+                    int j = g->head[cell_idx];
+                    
+                    while (j != -1) { //mientras haya boids en la lista
+                        if (i != j) {
+                            const boid *other = &boids[j];
+
+                            if (boids_are_neighbors(observer, other, cfg)) {
+                                // Separación
+                                vec3 vector_huida = boids_offset(other, observer, cfg); 
+                                float distance = sqrtf(vec3_length2(vector_huida));
+                                if (distance > 0.001f) {
+                                    vec3 push_force = vec3_scale(vector_huida, 1.0f / distance);
+                                    separation = vec3_add(separation, push_force);
+                                }
+
+                                // Alineación
+                                alignment = vec3_add(alignment, other->velocity);
+
+                                // Cohesión
+                                vec3 vector_acercar = boids_offset(observer, other, cfg);
+                                cohesion = vec3_add(cohesion, vector_acercar);
+
+                                neighbor_count++;
+                            }
+                        }
+                        
+                        //siguiente boid de esta celda
+                        j = g->next[j]; 
+                    }
+                }
             }
-
-            const boid *other = &boids[j];
-
-            if (!boids_are_neighbors(observer, other, cfg)) {
-                continue;
-            }
-
-            //separacion
-            vec3 vector_huida = boids_offset(other, observer, cfg); 
-            float distance = sqrtf(vec3_length2(vector_huida));
-
-            if (distance > 0.001f) { // Evitar divisiones por cero
-                // cuanto más cerca, más fuerte es el rechazo
-                vec3 push_force = vec3_scale(vector_huida, 1.0f / distance);
-                separation = vec3_add(separation, push_force);
-            }
-
-            //alineacion
-            alignment = vec3_add(alignment, other->velocity);
-
-            //cohesion
-            vec3 vector_acercar = boids_offset(observer, other, cfg);
-            cohesion = vec3_add(cohesion, vector_acercar);
-
-            neighbor_count++;
         }
 
+        // Aplicar promedios y pesos
         if (neighbor_count > 0){
-            //promediar las fuerzas
             alignment = vec3_scale(alignment, 1.0f / neighbor_count);
             cohesion = vec3_scale(cohesion, 1.0f / neighbor_count);
 
-            //aplicar pesos
             vec3 sep_force = vec3_scale(separation, cfg->separation_weight);
             vec3 ali_force = vec3_scale(alignment, cfg->alignment_weight);
             vec3 coh_force = vec3_scale(cohesion, cfg->cohesion_weight);
 
-            //sumo las fuerzas a la aceleración
             observer->acceleration = vec3_add(observer->acceleration, sep_force);
             observer->acceleration = vec3_add(observer->acceleration, ali_force);
             observer->acceleration = vec3_add(observer->acceleration, coh_force);
@@ -250,15 +292,60 @@ void boids_compute_accelerations(boid *boids, const config *cfg) {
     }
 }
 
+spatial_grid spatial_grid_init(const config *cfg){
+    spatial_grid g;
+    g.cell_size = cfg->vision_radius;
+
+    //numero de celdas por dimension
+    g.cells_x = (int)((2.0f * cfg->world_size) / g.cell_size) + 1;
+    g.cells_y = g.cells_x;
+    g.cells_z = g.cells_x;
+    g.total_cells = g.cells_x*g.cells_y*g.cells_z;
+    g.world_offset = cfg->world_size;
+
+    g.head = malloc(g.total_cells * sizeof(int));
+    g.next = malloc(cfg->num_boids * sizeof(int));
+    
+    return g;
+}
+
+// actualizador de posiciones de boids en el grid
+void grid_build(spatial_grid *g, const boid *boids, const config *cfg) {
+    //vaciar el grid
+    for (int i = 0; i < g->total_cells; i++) {
+        g->head[i] = -1;
+    }
+
+    //insertar cada boid en su celda correspondiente
+    for (int i = 0; i < cfg->num_boids; i++) {
+        //desplazar la posición para que siempre sea positiva y dividir por el tamaño de celda
+        int cx = (int)((boids[i].position.x + g->world_offset) / g->cell_size);
+        int cy = (int)((boids[i].position.y + g->world_offset) / g->cell_size);
+        int cz = (int)((boids[i].position.z + g->world_offset) / g->cell_size);
+
+        //limitar por seguridad si un boid se sale un poco del límite antes de rebotar
+        if (cx < 0) cx = 0; else if (cx >= g->cells_x) cx = g->cells_x - 1;
+        if (cy < 0) cy = 0; else if (cy >= g->cells_y) cy = g->cells_y - 1;
+        if (cz < 0) cz = 0; else if (cz >= g->cells_z) cz = g->cells_z - 1;
+
+        //convertir indice 3d a 1d
+        int cell_idx = cx + cy * g->cells_x + cz * g->cells_x * g->cells_y;
+        
+        //el boid apunta al boid que antes estaba de head y este se convierte en el nuevo head
+        g->next[i] = g->head[cell_idx];
+        g->head[cell_idx] = i;
+    }
+}
+
 int main() {
     config cfg = {
-        .num_boids = 1000,
+        .num_boids = 10000,
         .min_speed = 1.0f,
         .max_speed = 5.0f,
         .vision_radius = 10.0f,
         .blind_angle = 1.0f, //radianes (aprox 57 grados)
         .cos_blind_angle = 0.0f, // pendiente: precalcular con cosf(blind_angle)
-        .world_size = 100,
+        .world_size = 200,
         .separation_weight = 0.3f,
         .alignment_weight = 0.3f,
         .cohesion_weight = 0.3f,
@@ -278,6 +365,9 @@ int main() {
     //generación inicial de los boids
     boids_init(boids, &cfg);
 
+    //generación del grid
+    spatial_grid grid = spatial_grid_init(&cfg);
+
     InitWindow(1280, 720, "Boids 3D");
     SetTargetFPS(60);
     DisableCursor();
@@ -295,8 +385,10 @@ int main() {
         simulation_handle_input(&cfg);
         UpdateCamera(&camera, CAMERA_FREE);
 
+        //rellenar grid
+        grid_build(&grid, boids, &cfg);
         //calculo de reglas (separacion, alineacion, cohesion)
-        boids_compute_accelerations(boids, &cfg);
+        boids_compute_accelerations(boids, &cfg, &grid);
         //actualizacion de boids
         boids_update(boids, &cfg, dt);
 
@@ -319,16 +411,6 @@ int main() {
         for (int i = 0; i < cfg.num_boids; i++) {
             boid *b = &boids[i];
 
-            Color color;
-
-            if (i == 0) {
-                color = YELLOW;
-            } else if (boids_are_neighbors(&boids[0], b, &cfg)) {
-                color = GREEN;
-            } else {
-                color = SKYBLUE;
-            }
-
             vec3 direction = vec3_normalize(b->velocity);
             const float half_length = 0.3f;
 
@@ -343,8 +425,8 @@ int main() {
                 b->position.z + direction.z * half_length
             };
 
-            //dibujo el boid y lo pinto en funcion de quien es
-            DrawCylinderEx(base, tip, 0.18f, 0.0f, 8, color);
+            //dibujo el boid
+            DrawCylinderEx(base, tip, 0.18f, 0.0f, 8, SKYBLUE);
         }
 
         EndMode3D();
@@ -355,6 +437,9 @@ int main() {
 
     CloseWindow();
 
+    //librerar arrays del grid
+    free(grid.head);
+    free(grid.next);
     //liberar memoria del array de boids
     free(boids);
 
