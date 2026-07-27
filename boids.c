@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include "vec3.h"
 #include "raylib.h"
 
@@ -45,6 +46,47 @@ void simulation_handle_input(config *cfg) {
             cfg->boundary_mode = BOUNDARY_BOUNCE;
         }
     }
+}
+
+// comprueba que las restas de las distancias no se pasen del tamaño del mapa
+float wrapped_delta(float delta, float limit) {
+    float world_width = limit * 2.0f;
+
+    if (delta > limit) {
+        delta -= world_width;
+    } else if (delta < -limit) {
+        delta += world_width;
+    }
+
+    return delta;
+}
+
+// devuelve el vector mas corto entre a y b
+vec3 boids_offset(const boid *a, const boid *b, const config *cfg) {
+    vec3 offset = vec3_sub(b->position, a->position);
+
+    if (cfg->boundary_mode == BOUNDARY_WRAP) {
+        offset.x = wrapped_delta(offset.x, cfg->world_size);
+        offset.y = wrapped_delta(offset.y, cfg->world_size);
+        offset.z = wrapped_delta(offset.z, cfg->world_size);
+    }
+
+    return offset;
+}
+
+// devuelve true si la distancia entre boids es igual o menor que el radio de vision limite
+bool boids_are_neighbors(const boid *a, const boid *b, const config *cfg) {
+    if (a == b) {
+        return false;
+    }
+
+    vec3 offset = boids_offset(a, b, cfg);
+    // distancia al cuadrado
+    float distance2 = vec3_length2(offset);
+    //radio de vision al cuadrado
+    float vision_radius2 = cfg->vision_radius * cfg->vision_radius;
+
+    return distance2 <= vision_radius2;
 }
 
 // aplica el teletransporte a la dimension recibida
@@ -138,6 +180,7 @@ void boids_update(boid *boids, const config *cfg, float dt){
         //la velocidad hace que cambie la posición
         b->position = vec3_add(b->position, vec3_scale(b->velocity, dt));
 
+        // aplica comportamiento con el borde del mapa
         boid_apply_boundary(b, cfg);
 
         //vaciar aceleracion acumulada para el siguiente frame
@@ -145,12 +188,36 @@ void boids_update(boid *boids, const config *cfg, float dt){
     }
 }
 
+void boids_compute_accelerations(boid *boids, const config *cfg) {
+    for (int i = 0; i < cfg->num_boids; i++) {
+        boid *observer = &boids[i];
+
+        int neighbor_count = 0;
+
+        for (int j = 0; j < cfg->num_boids; j++) {
+            if (i == j) {
+                continue;
+            }
+
+            const boid *other = &boids[j];
+
+            if (!boids_are_neighbors(observer, other, cfg)) {
+                continue;
+            }
+
+            neighbor_count++;
+
+            //aplicar reglas
+        }
+    }
+}
+
 int main() {
     config cfg = {
-        .num_boids = 500,
+        .num_boids = 50,
         .min_speed = 1.0f,
         .max_speed = 5.0f,
-        .vision_radius = 10.0f,
+        .vision_radius = 3.0f,
         .blind_angle = 1.0f, //radianes (aprox 57 grados)
         .cos_blind_angle = 0.0f, // pendiente: precalcular con cosf(blind_angle)
         .world_size = 10,
@@ -186,6 +253,10 @@ int main() {
 
         simulation_handle_input(&cfg);
         UpdateCamera(&camera, CAMERA_FREE);
+
+        //calculo de reglas (separacion, alineacion, cohesion)
+        boids_compute_accelerations(boids, &cfg);
+        //actualizacion de boids
         boids_update(boids, &cfg, dt);
 
         BeginDrawing();
@@ -206,6 +277,17 @@ int main() {
         // dibujar cada boid como un cono orientado en su direccion de vuelo
         for (int i = 0; i < cfg.num_boids; i++) {
             boid *b = &boids[i];
+
+            Color color;
+
+            if (i == 0) {
+                color = YELLOW;
+            } else if (boids_are_neighbors(&boids[0], b, &cfg)) {
+                color = GREEN;
+            } else {
+                color = SKYBLUE;
+            }
+
             vec3 direction = vec3_normalize(b->velocity);
             const float half_length = 0.3f;
 
@@ -220,12 +302,8 @@ int main() {
                 b->position.z + direction.z * half_length
             };
 
-            // pinto uno de amarillo para poder seguirlo
-            if (i == 0){
-                DrawCylinderEx(base, tip, 0.18f, 0.0f, 8, YELLOW);
-            } else {
-                DrawCylinderEx(base, tip, 0.18f, 0.0f, 8, SKYBLUE);
-            }
+            //dibujo el boid y lo pinto en funcion de quien es
+            DrawCylinderEx(base, tip, 0.18f, 0.0f, 8, color);
         }
 
         EndMode3D();
