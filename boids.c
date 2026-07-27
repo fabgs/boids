@@ -345,7 +345,7 @@ int main() {
         .vision_radius = 10.0f,
         .blind_angle = 1.0f, //radianes (aprox 57 grados)
         .cos_blind_angle = 0.0f, // pendiente: precalcular con cosf(blind_angle)
-        .world_size = 200,
+        .world_size = 150,
         .separation_weight = 0.3f,
         .alignment_weight = 0.3f,
         .cohesion_weight = 0.3f,
@@ -368,7 +368,7 @@ int main() {
     //generación del grid
     spatial_grid grid = spatial_grid_init(&cfg);
 
-    InitWindow(1280, 720, "Boids 3D");
+    InitWindow(1920, 1080, "Boids 3D");
     SetTargetFPS(60);
     DisableCursor();
 
