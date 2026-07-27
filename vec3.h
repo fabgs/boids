@@ -45,4 +45,16 @@ static inline vec3 vec3_normalize(vec3 v) {
     return (vec3){0, 0, 0};
 }
 
+static inline vec3 vec3_clamp_length(vec3 v, float min, float max) {
+    float len2 = vec3_length2(v);
+
+    if (len2 > max*max){
+        return vec3_scale(vec3_normalize(v), max);
+    } else if ((len2 < min*min) && (len2 > 0)){
+        return vec3_scale(vec3_normalize(v), min);
+    }
+
+    return v;
+}
+
 #endif // VEC3_H
