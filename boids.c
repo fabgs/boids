@@ -200,6 +200,7 @@ void boids_update(boid *boids, const config *cfg, float dt){
 
 // calcula las aceleraciones en base a las reglas de reynolds
 void boids_compute_accelerations(boid *boids, const config *cfg, const spatial_grid *g) {
+    #pragma omp parallel for
     for (int i = 0; i < cfg->num_boids; i++) {
         boid *observer = &boids[i];
         int neighbor_count = 0;
@@ -339,13 +340,13 @@ void grid_build(spatial_grid *g, const boid *boids, const config *cfg) {
 
 int main() {
     config cfg = {
-        .num_boids = 10000,
+        .num_boids = 20000,
         .min_speed = 1.0f,
         .max_speed = 5.0f,
         .vision_radius = 10.0f,
         .blind_angle = 1.0f, //radianes (aprox 57 grados)
         .cos_blind_angle = 0.0f, // pendiente: precalcular con cosf(blind_angle)
-        .world_size = 150,
+        .world_size = 200,
         .separation_weight = 0.3f,
         .alignment_weight = 0.3f,
         .cohesion_weight = 0.3f,
@@ -383,7 +384,39 @@ int main() {
         float dt = GetFrameTime();
 
         simulation_handle_input(&cfg);
-        UpdateCamera(&camera, CAMERA_FREE);
+
+        //UpdateCamera(&camera, CAMERA_FREE); //camara antes
+        //velocidad de la camara
+        float base_speed = 150.0f;
+        
+        // Sprint al mantener Shift
+        if (IsKeyDown(KEY_LEFT_SHIFT)) base_speed *= 3.0f; 
+        
+        float cam_speed = base_speed * dt;
+
+        Vector3 movement = {0};
+        if (IsKeyDown(KEY_W)) movement.x += cam_speed;
+        if (IsKeyDown(KEY_S)) movement.x -= cam_speed;
+        if (IsKeyDown(KEY_D)) movement.y += cam_speed;
+        if (IsKeyDown(KEY_A)) movement.y -= cam_speed;
+        
+        // espacio y shift para subir y bajar
+        if (IsKeyDown(KEY_SPACE)) movement.z += cam_speed; 
+        if (IsKeyDown(KEY_LEFT_SHIFT)) movement.z -= cam_speed; 
+
+        // rotación con el ratón
+        Vector2 mouseDelta = GetMouseDelta();
+        Vector3 rotation = {
+            mouseDelta.x * 0.1f, // Sensibilidad X
+            mouseDelta.y * 0.1f, // Sensibilidad Y
+            0.0f
+        };
+
+        // zoom con la rueda
+        float zoom = GetMouseWheelMove() * 2.0f;
+
+        // se pasa el calculo a update camera
+        UpdateCameraPro(&camera, movement, rotation, zoom);
 
         //rellenar grid
         grid_build(&grid, boids, &cfg);
@@ -426,7 +459,14 @@ int main() {
             };
 
             //dibujo el boid
-            DrawCylinderEx(base, tip, 0.18f, 0.0f, 8, SKYBLUE);
+            if(i==0){
+                DrawCylinderEx(base, tip, 0.18f, 0.0f, 8, YELLOW);
+
+                Vector3 center = { b->position.x, b->position.y, b->position.z };
+
+                DrawSphereWires(center, cfg.vision_radius, 16, 16, Fade(GREEN, 0.4f));
+            } else
+                DrawCylinderEx(base, tip, 0.18f, 0.0f, 8, SKYBLUE);
         }
 
         EndMode3D();
