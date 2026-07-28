@@ -58,16 +58,12 @@ const char *instancingVS =
 
 const char *instancingFS =
     "#version 330\n"
-    "in vec3 fragNormal;\n"
     "uniform vec4 colDiffuse;\n"
     "out vec4 finalColor;\n"
     "void main()\n"
     "{\n"
-    "    vec3 lightDir = normalize(vec3(1.0, 2.0, 1.0));\n"
-    "    float light = max(dot(fragNormal, lightDir), 0.3);\n" 
-    "    finalColor = vec4(colDiffuse.rgb * light, colDiffuse.a);\n"
+    "    finalColor = colDiffuse;\n"
     "}\n";
-
 // genera un float aleatorio entre dos valores
 float rand_range(float a, float b){
     return a + (rand() / (float)RAND_MAX) * (b-a);
