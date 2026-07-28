@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include "vec3.h"
 #include "raylib.h"
+#include "raymath.h"
 
 typedef enum {
     BOUNDARY_BOUNCE,
@@ -41,6 +42,31 @@ typedef struct{
     float cohesion_weight; // peso de la fuerza de cohesión
     boundary_mode boundary_mode;
 } config;
+
+const char *instancingVS =
+    "#version 330\n"
+    "in vec3 vertexPosition;\n"
+    "in vec3 vertexNormal;\n"
+    "in mat4 instanceTransform;\n"
+    "uniform mat4 mvp;\n"
+    "out vec3 fragNormal;\n"
+    "void main()\n"
+    "{\n"
+    "    fragNormal = normalize(mat3(instanceTransform) * vertexNormal);\n"
+    "    gl_Position = mvp * instanceTransform * vec4(vertexPosition, 1.0);\n"
+    "}\n";
+
+const char *instancingFS =
+    "#version 330\n"
+    "in vec3 fragNormal;\n"
+    "uniform vec4 colDiffuse;\n"
+    "out vec4 finalColor;\n"
+    "void main()\n"
+    "{\n"
+    "    vec3 lightDir = normalize(vec3(1.0, 2.0, 1.0));\n"
+    "    float light = max(dot(fragNormal, lightDir), 0.3);\n" 
+    "    finalColor = vec4(colDiffuse.rgb * light, colDiffuse.a);\n"
+    "}\n";
 
 // genera un float aleatorio entre dos valores
 float rand_range(float a, float b){
@@ -340,7 +366,7 @@ void grid_build(spatial_grid *g, const boid *boids, const config *cfg) {
 
 int main() {
     config cfg = {
-        .num_boids = 20000,
+        .num_boids = 50000,
         .min_speed = 1.0f,
         .max_speed = 5.0f,
         .vision_radius = 10.0f,
@@ -373,6 +399,24 @@ int main() {
     SetTargetFPS(60);
     DisableCursor();
 
+    //creo un cono para un boid
+    Mesh boidMesh = GenMeshCone(0.18f, 0.6f, 8);
+
+    //asigno material y pinto de azul
+    Material boidMaterial = LoadMaterialDefault();
+    boidMaterial.maps[MATERIAL_MAP_ALBEDO].color = SKYBLUE;
+
+    //shader para visualizacion de los boids
+    Shader shader = LoadShaderFromMemory(instancingVS, instancingFS);
+
+    shader.locs[SHADER_LOC_MATRIX_MVP] = GetShaderLocation(shader, "mvp");
+    shader.locs[SHADER_LOC_MATRIX_MODEL] = GetShaderLocationAttrib(shader, "instanceTransform");
+
+    boidMaterial.shader = shader;
+
+    //reserva de memoria
+    Matrix *boidTransforms = malloc(sizeof(Matrix) * cfg.num_boids);
+
     Camera3D camera = {0};
     camera.position = (Vector3){cfg.world_size+10.0f, cfg.world_size+10.0f, cfg.world_size+10.0f};
     camera.target = (Vector3){0.0f, 0.0f, 0.0f};
@@ -389,8 +433,8 @@ int main() {
         //velocidad de la camara
         float base_speed = 150.0f;
         
-        // Sprint al mantener Shift
-        if (IsKeyDown(KEY_LEFT_SHIFT)) base_speed *= 3.0f; 
+        // Sprint al mantener Control
+        if (IsKeyDown(KEY_LEFT_CONTROL)) base_speed *= 3.0f; 
         
         float cam_speed = base_speed * dt;
 
@@ -425,6 +469,28 @@ int main() {
         //actualizacion de boids
         boids_update(boids, &cfg, dt);
 
+        #pragma omp parallel for
+        for (int i = 0; i < cfg.num_boids; i++) {
+            boid *b = &boids[i];
+            
+            //la dirección en la que vuela el boid normalizada
+            vec3 dir_v = vec3_normalize(b->velocity);
+            Vector3 dir = { dir_v.x, dir_v.y, dir_v.z };
+            
+            //los conos de Raylib se generan mirando hacia arriba
+            Vector3 up_default = { 0.0f, 1.0f, 0.0f };
+            
+            //se calcula como rotar desde arriba hasta donde mira el boid
+            Quaternion q = QuaternionFromVector3ToVector3(up_default, dir);
+            Matrix rot = QuaternionToMatrix(q);
+            
+            //se calcula la matriz de su posicion en el mundo
+            Matrix trans = MatrixTranslate(b->position.x, b->position.y, b->position.z);
+            
+            //multiplicacion de las matrices, primero se rota y luego se translada
+            boidTransforms[i] = MatrixMultiply(rot, trans);
+        }
+
         BeginDrawing();
         ClearBackground((Color){20, 22, 28, 255});
 
@@ -440,34 +506,8 @@ int main() {
             GRAY
         );
 
-        // dibujar cada boid como un cono orientado en su direccion de vuelo
-        for (int i = 0; i < cfg.num_boids; i++) {
-            boid *b = &boids[i];
-
-            vec3 direction = vec3_normalize(b->velocity);
-            const float half_length = 0.3f;
-
-            Vector3 base = {
-                b->position.x - direction.x * half_length,
-                b->position.y - direction.y * half_length,
-                b->position.z - direction.z * half_length
-            };
-            Vector3 tip = {
-                b->position.x + direction.x * half_length,
-                b->position.y + direction.y * half_length,
-                b->position.z + direction.z * half_length
-            };
-
-            //dibujo el boid
-            if(i==0){
-                DrawCylinderEx(base, tip, 0.18f, 0.0f, 8, YELLOW);
-
-                Vector3 center = { b->position.x, b->position.y, b->position.z };
-
-                DrawSphereWires(center, cfg.vision_radius, 16, 16, Fade(GREEN, 0.4f));
-            } else
-                DrawCylinderEx(base, tip, 0.18f, 0.0f, 8, SKYBLUE);
-        }
+        //dibujado directo de todos los boids
+        DrawMeshInstanced(boidMesh, boidMaterial, boidTransforms, cfg.num_boids);
 
         EndMode3D();
 
@@ -477,6 +517,9 @@ int main() {
 
     CloseWindow();
 
+    //liberar memoria del mesh de boids
+    free(boidTransforms);
+    UnloadMesh(boidMesh);
     //librerar arrays del grid
     free(grid.head);
     free(grid.next);
