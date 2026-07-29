@@ -40,6 +40,9 @@ typedef struct{
     float separation_weight; // peso de la fuerza de separación
     float alignment_weight; // peso de la fuerza de alineación
     float cohesion_weight; // peso de la fuerza de cohesión
+    float wander_weight; // peso de aleatoriedad de movimiento
+    float agility; // facilidad para girar y frenar
+    float noise_table[1024];
     boundary_mode boundary_mode;
 } config;
 
@@ -106,7 +109,7 @@ vec3 boids_offset(const boid *a, const boid *b, const config *cfg) {
     return offset;
 }
 
-// devuelve true si la distancia entre boids es igual o menor que el radio de vision limite
+// devuelve true si la distancia entre boids es igual o menor que el radio de vision limite y si no esta en punto ciego
 bool boids_are_neighbors(const boid *a, const boid *b, const config *cfg) {
     if (a == b) {
         return false;
@@ -115,10 +118,8 @@ bool boids_are_neighbors(const boid *a, const boid *b, const config *cfg) {
     vec3 offset = boids_offset(a, b, cfg);
     // distancia al cuadrado
     float distance2 = vec3_length2(offset);
-    //radio de vision al cuadrado
-    float vision_radius2 = cfg->vision_radius * cfg->vision_radius;
-
-    return distance2 <= vision_radius2;
+    // devuelve si la distancia es menor o igual que el radio de vision y si la distancia es mayor a 0
+    return (distance2 <= cfg->vision_radius * cfg->vision_radius && distance2 > 0.0001f);
 }
 
 // aplica el teletransporte a la dimension recibida
@@ -221,11 +222,22 @@ void boids_update(boid *boids, const config *cfg, float dt){
 }
 
 // calcula las aceleraciones en base a las reglas de reynolds
-void boids_compute_accelerations(boid *boids, const config *cfg, const spatial_grid *g) {
+void boids_compute_accelerations(boid *boids, const config *cfg, const spatial_grid *g, float time_sec) {
     #pragma omp parallel for
     for (int i = 0; i < cfg->num_boids; i++) {
         boid *observer = &boids[i];
-        int neighbor_count = 0;
+        int total_neighbors = 0; // para saber si estoy solo y frenar
+        int visual_neighbors = 0; // para saber a quien seguir
+
+        //direccion a la que mira el boid
+        float speed2 = vec3_length2(observer->velocity);
+        float current_speed = sqrtf(speed2);
+        vec3 fwd_dir = {0, 0, 0};
+        if (current_speed > 0.001f) {
+            fwd_dir.x = observer->velocity.x / current_speed;
+            fwd_dir.y = observer->velocity.y / current_speed;
+            fwd_dir.z = observer->velocity.z / current_speed;
+        }
 
         vec3 separation = {0, 0, 0};
         vec3 alignment = {0, 0, 0};
@@ -273,22 +285,25 @@ void boids_compute_accelerations(boid *boids, const config *cfg, const spatial_g
                             const boid *other = &boids[j];
 
                             if (boids_are_neighbors(observer, other, cfg)) {
-                                // Separación
-                                vec3 vector_huida = boids_offset(other, observer, cfg); 
-                                float distance = sqrtf(vec3_length2(vector_huida));
-                                if (distance > 0.001f) {
-                                    vec3 push_force = vec3_scale(vector_huida, 1.0f / distance);
-                                    separation = vec3_add(separation, push_force);
+                                vec3 offset_to_other = boids_offset(observer, other, cfg); 
+                                float distance = sqrtf(vec3_length2(offset_to_other));
+                                
+                                // separacion tiene en cuenta todo al rededor
+                                vec3 push_force = vec3_scale(offset_to_other, -1.0f / distance);
+                                separation = vec3_add(separation, push_force);
+                                total_neighbors++;
+
+                                // angulo ciego para cohesion y alineación
+                                float dir_x = offset_to_other.x / distance;
+                                float dir_y = offset_to_other.y / distance;
+                                float dir_z = offset_to_other.z / distance;
+                                float dot_prod = (fwd_dir.x * dir_x) + (fwd_dir.y * dir_y) + (fwd_dir.z * dir_z);
+                                
+                                if (dot_prod >= cfg->cos_blind_angle) {
+                                    alignment = vec3_add(alignment, other->velocity);
+                                    cohesion = vec3_add(cohesion, offset_to_other);
+                                    visual_neighbors++;
                                 }
-
-                                // Alineación
-                                alignment = vec3_add(alignment, other->velocity);
-
-                                // Cohesión
-                                vec3 vector_acercar = boids_offset(observer, other, cfg);
-                                cohesion = vec3_add(cohesion, vector_acercar);
-
-                                neighbor_count++;
                             }
                         }
                         
@@ -299,18 +314,53 @@ void boids_compute_accelerations(boid *boids, const config *cfg, const spatial_g
             }
         }
 
-        // Aplicar promedios y pesos
-        if (neighbor_count > 0){
-            alignment = vec3_scale(alignment, 1.0f / neighbor_count);
-            cohesion = vec3_scale(cohesion, 1.0f / neighbor_count);
+        // genero del ruido para el movimiento aleatorio
+        float t = time_sec * 1.5f; // Velocidad del aleteo (mas bajo = mas suave)
+        int idx1 = (int)t;
+        int idx2 = idx1 + 1;
+        float fract = t - (float)idx1; // Porcentaje de transición entre casillas
 
-            vec3 sep_force = vec3_scale(separation, cfg->separation_weight);
-            vec3 ali_force = vec3_scale(alignment, cfg->alignment_weight);
-            vec3 coh_force = vec3_scale(cohesion, cfg->cohesion_weight);
+        // Eje X
+        int x1 = (i * 3 + idx1) % 1024;
+        int x2 = (i * 3 + idx2) % 1024;
+        float noise_x = cfg->noise_table[x1] * (1.0f - fract) + cfg->noise_table[x2] * fract;
 
-            observer->acceleration = vec3_add(observer->acceleration, sep_force);
-            observer->acceleration = vec3_add(observer->acceleration, ali_force);
-            observer->acceleration = vec3_add(observer->acceleration, coh_force);
+        // Eje Y
+        int y1 = (i * 7 + idx1 + 333) % 1024;
+        int y2 = (i * 7 + idx2 + 333) % 1024;
+        float noise_y = cfg->noise_table[y1] * (1.0f - fract) + cfg->noise_table[y2] * fract;
+
+        // Eje Z
+        int z1 = (i * 11 + idx1 + 666) % 1024;
+        int z2 = (i * 11 + idx2 + 666) % 1024;
+        float noise_z = cfg->noise_table[z1] * (1.0f - fract) + cfg->noise_table[z2] * fract;
+
+        //direccion deseada
+        vec3 desired_dir = {
+            noise_x * cfg->wander_weight,
+            noise_y * cfg->wander_weight,
+            noise_z * cfg->wander_weight
+        };
+
+        // si hay vecinos visible se aplica alineacion y cohesion
+        if (visual_neighbors > 0) {
+            alignment = vec3_scale(alignment, 1.0f / visual_neighbors);
+            cohesion = vec3_scale(cohesion, 1.0f / visual_neighbors);
+        }
+
+        if (total_neighbors > 0) desired_dir = vec3_add(desired_dir, vec3_scale(separation, cfg->separation_weight));
+        if (visual_neighbors > 0) desired_dir = vec3_add(desired_dir, vec3_scale(alignment, cfg->alignment_weight));
+        if (visual_neighbors > 0) desired_dir = vec3_add(desired_dir, vec3_scale(cohesion, cfg->cohesion_weight));
+        // acelero si hay grupo y freno si estoy solo
+        float target_speed = (total_neighbors > 0) ? cfg->max_speed : cfg->min_speed;
+        
+        float dir_len = sqrtf(vec3_length2(desired_dir));
+        if (dir_len > 0.001f) {
+            vec3 desired_vel = vec3_scale(desired_dir, target_speed / dir_len);
+            
+            observer->acceleration.x += (desired_vel.x - observer->velocity.x) * cfg->agility;
+            observer->acceleration.y += (desired_vel.y - observer->velocity.y) * cfg->agility;
+            observer->acceleration.z += (desired_vel.z - observer->velocity.z) * cfg->agility;
         }
     }
 }
@@ -363,17 +413,27 @@ void grid_build(spatial_grid *g, const boid *boids, const config *cfg) {
 int main() {
     config cfg = {
         .num_boids = 50000,
-        .min_speed = 1.0f,
-        .max_speed = 5.0f,
+        .min_speed = 5.0f,
+        .max_speed = 15.0f,
         .vision_radius = 10.0f,
         .blind_angle = 1.0f, //radianes (aprox 57 grados)
-        .cos_blind_angle = 0.0f, // pendiente: precalcular con cosf(blind_angle)
+        .cos_blind_angle = 0.0f,
         .world_size = 200,
-        .separation_weight = 0.3f,
+        .separation_weight = 0.5f,
         .alignment_weight = 0.3f,
-        .cohesion_weight = 0.3f,
-        .boundary_mode = BOUNDARY_BOUNCE,
+        .cohesion_weight = 0.5f,
+        .wander_weight = 0.1f,
+        .agility = 5.0f,
+        .boundary_mode = BOUNDARY_WRAP,
     };
+
+    //calculo del coseno del angulo muerto
+    cfg.cos_blind_angle = cosf(PI - cfg.blind_angle);
+
+    // calculo de una tabla de aleatoriedad para no hacer calculos con el ruido
+    for (int i = 0; i < 1024; i++) {
+        cfg.noise_table[i] = rand_range(-1.0f, 1.0f);
+    }
 
     // semilla aleatoria
     srand(1);
@@ -460,8 +520,10 @@ int main() {
 
         //rellenar grid
         grid_build(&grid, boids, &cfg);
+        //tiempo actual
+        float time_sec = (float)GetTime();
         //calculo de reglas (separacion, alineacion, cohesion)
-        boids_compute_accelerations(boids, &cfg, &grid);
+        boids_compute_accelerations(boids, &cfg, &grid, time_sec);
         //actualizacion de boids
         boids_update(boids, &cfg, dt);
 
