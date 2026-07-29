@@ -26,6 +26,7 @@ typedef struct {
     int *next; //array del tamaño de num_boids
     int cells_x, cells_y, cells_z; //celdas por eje
     int total_cells;
+    int allocated_cells; // para saber cuánta memoria tenemos reservada
     float cell_size;
     float world_offset; // pasar de -mundo, +mundo a 0, mundo*2
 } spatial_grid;
@@ -33,6 +34,7 @@ typedef struct {
 // estructura que representa la configuración para el sistema de boids
 typedef struct{
     int num_boids;
+    int max_boids; // limite de boids totales
     float min_speed;
     float max_speed;
     float vision_radius; // radio de visión de los boids
@@ -172,7 +174,7 @@ void boid_apply_boundary(boid *b, const config *cfg){
 
 // inicializa la posición, velocidad y aceleración de los boids
 void boids_init(boid *boids, const config *cfg){
-    for (int i = 0; i < cfg->num_boids; i++){
+    for (int i = 0; i < cfg->max_boids; i++){
         //creo un puntero a la posicion del boid
         boid *b = &boids[i];
 
@@ -390,16 +392,32 @@ spatial_grid spatial_grid_init(const config *cfg){
     g.cells_y = g.cells_x;
     g.cells_z = g.cells_x;
     g.total_cells = g.cells_x*g.cells_y*g.cells_z;
+    g.allocated_cells = g.total_cells;
     g.world_offset = cfg->world_size;
 
-    g.head = malloc(g.total_cells * sizeof(int));
-    g.next = malloc(cfg->num_boids * sizeof(int));
+    g.head = malloc(g.allocated_cells * sizeof(int));
+    g.next = malloc(cfg->max_boids * sizeof(int));
     
     return g;
 }
 
 // actualizador de posiciones de boids en el grid
 void grid_build(spatial_grid *g, const boid *boids, const config *cfg) {
+    // Recalcular parametros por si el usuario ha movido el slider
+    g->cell_size = cfg->vision_radius;
+    g->cells_x = (int)((2.0f * cfg->world_size) / g->cell_size) + 1;
+    g->cells_y = g->cells_x;
+    g->cells_z = g->cells_x;
+    int new_total = g->cells_x * g->cells_y * g->cells_z;
+    g->world_offset = cfg->world_size;
+
+    // si el nuevo mundo necesita más celdas de las que tenemos se amplia memoria
+    if (new_total > g->allocated_cells) {
+        g->head = realloc(g->head, new_total * sizeof(int));
+        g->allocated_cells = new_total;
+    }
+    g->total_cells = new_total;
+
     //vaciar el grid
     for (int i = 0; i < g->total_cells; i++) {
         g->head[i] = -1;
@@ -429,6 +447,7 @@ void grid_build(spatial_grid *g, const boid *boids, const config *cfg) {
 int main() {
     config cfg = {
         .num_boids = 50000,
+        .max_boids = 100000,
         .min_speed = 5.0f,
         .max_speed = 15.0f,
         .vision_radius = 10.0f,
@@ -456,7 +475,7 @@ int main() {
     srand(1);
 
     // array dinamico para los boids
-    boid *boids = malloc(sizeof(boid) * cfg.num_boids);
+    boid *boids = malloc(sizeof(boid) * cfg.max_boids);
 
     //check null de la asignacion anterior
     if (boids == NULL) return 1;
@@ -472,6 +491,27 @@ int main() {
 
     InitWindow(1920, 1080, "Boids 3D");
     SetTargetFPS(60);
+
+    //estilos para la ui
+
+    // color del fondo
+    GuiSetStyle(DEFAULT, BACKGROUND_COLOR, 0x15171CFF);
+    GuiSetStyle(DEFAULT, LINE_COLOR, 0x2A2F3AFF);
+
+    // Colores Base
+    GuiSetStyle(DEFAULT, BASE_COLOR_NORMAL, 0x20242BFF); 
+    GuiSetStyle(DEFAULT, BASE_COLOR_FOCUSED, 0x2A2F3AFF);
+    GuiSetStyle(DEFAULT, BASE_COLOR_PRESSED, 0x5BB2D9FF);
+
+    // Colores de los Bordes
+    GuiSetStyle(DEFAULT, BORDER_COLOR_NORMAL, 0x2A2F3AFF); 
+    GuiSetStyle(DEFAULT, BORDER_COLOR_FOCUSED, 0x5BB2D9FF);
+    GuiSetStyle(DEFAULT, BORDER_COLOR_PRESSED, 0x0492C7FF);
+
+    // Colores del Texto
+    GuiSetStyle(DEFAULT, TEXT_COLOR_NORMAL, 0x8FA4B5FF);
+    GuiSetStyle(DEFAULT, TEXT_COLOR_FOCUSED, 0xC9EFFEFF);
+    GuiSetStyle(DEFAULT, TEXT_COLOR_PRESSED, 0xC9EFFEFF);
 
     if (show_ui) EnableCursor();
     else DisableCursor();
@@ -492,7 +532,7 @@ int main() {
     boidMaterial.shader = shader;
 
     //reserva de memoria
-    Matrix *boidTransforms = malloc(sizeof(Matrix) * cfg.num_boids);
+    Matrix *boidTransforms = malloc(sizeof(Matrix) * cfg.max_boids);
 
     Camera3D camera = {0};
     camera.position = (Vector3){cfg.world_size+10.0f, cfg.world_size+10.0f, cfg.world_size+10.0f};
@@ -598,25 +638,68 @@ int main() {
         EndMode3D();
 
         if (show_ui) {
-            // Fondo semitransparente para que se lean bien las letras
-            DrawRectangle(10, 10, 320, 390, Fade(BLACK, 0.7f));
-            GuiPanel((Rectangle){ 10, 10, 320, 390 }, "LEYES DE LA FISICA (Pulsa TAB para volar)");
-
-            // Sliders que modifican tu struct directamente
-            GuiSlider((Rectangle){ 120, 50, 150, 20 }, "Min Speed", NULL, &cfg.min_speed, 1.0f, 20.0f);
-            GuiSlider((Rectangle){ 120, 80, 150, 20 }, "Max Speed", NULL, &cfg.max_speed, 10.0f, 50.0f);
-            GuiSlider((Rectangle){ 120, 110, 150, 20 }, "Vision Radius", NULL, &cfg.vision_radius, 1.0f, 50.0f);
+            int pW = 340;
+            int pH = 450;
             
-            // Slider del ángulo ciego + ¡Recálculo del coseno en vivo!
-            GuiSlider((Rectangle){ 120, 140, 150, 20 }, "Blind Angle", NULL, &cfg.blind_angle, 0.0f, PI);
+            // Ancho total de pantalla, menos el ancho del panel, menos 10 píxeles de margen
+            int pX = GetScreenWidth() - pW - 10; 
+            int pY = 10; // Pegado arriba
+            
+            GuiPanel((Rectangle){ (float)pX, (float)pY, (float)pW, (float)pH }, "Parameters (TAB to fly)");
+
+            // Coordenadas base para los sliders relativas al panel
+            int sX = pX + 110;
+            int sY = pY + 40;
+            int sW = 160;
+            int sH = 15;
+            int space = 28;
+
+            // Número de Boids
+            float active_boids = (float)cfg.num_boids;
+            GuiSliderBar((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH }, "Num Boids", TextFormat("%d", cfg.num_boids), &active_boids, 100.0f, (float)cfg.max_boids);
+            cfg.num_boids = (int)active_boids;
+
+            // Tamaño del Mundo
+            sY += space;
+            GuiSliderBar((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH }, "World Size", TextFormat("%.0f", cfg.world_size), &cfg.world_size, 50.0f, 400.0f);
+
+            // Comportamiento de los boids
+            sY += space;
+            GuiSliderBar((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH }, "Min Speed", TextFormat("%.1f", cfg.min_speed), &cfg.min_speed, 1.0f, 20.0f);
+
+            sY += space;
+            GuiSliderBar((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH }, "Max Speed", TextFormat("%.1f", cfg.max_speed), &cfg.max_speed, 10.0f, 50.0f);
+
+            sY += space;
+            GuiSliderBar((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH }, "Vision Radius", TextFormat("%.1f", cfg.vision_radius), &cfg.vision_radius, 1.0f, 50.0f);
+            
+            sY += space;
+            GuiSliderBar((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH }, "Blind Angle", TextFormat("%.2f rad", cfg.blind_angle), &cfg.blind_angle, 0.0f, PI);
             cfg.cos_blind_angle = cosf(PI - cfg.blind_angle); 
 
-            GuiSlider((Rectangle){ 120, 170, 150, 20 }, "Separation", NULL, &cfg.separation_weight, 0.0f, 2.0f);
-            GuiSlider((Rectangle){ 120, 200, 150, 20 }, "Alignment", NULL, &cfg.alignment_weight, 0.0f, 2.0f);
-            GuiSlider((Rectangle){ 120, 230, 150, 20 }, "Cohesion", NULL, &cfg.cohesion_weight, 0.0f, 2.0f);
-            GuiSlider((Rectangle){ 120, 260, 150, 20 }, "Wander (Ruido)", NULL, &cfg.wander_weight, 0.0f, 1.0f);
-            GuiSlider((Rectangle){ 120, 290, 150, 20 }, "Urgency", NULL, &cfg.urgency_multiplier, 0.01f, 1.0f);
-            GuiSlider((Rectangle){ 120, 320, 150, 20 }, "Agility", NULL, &cfg.agility, 0.1f, 10.0f);
+            sY += space;
+            GuiSliderBar((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH }, "Separation", TextFormat("%.2f", cfg.separation_weight), &cfg.separation_weight, 0.0f, 2.0f);
+            
+            sY += space;
+            GuiSliderBar((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH }, "Alignment", TextFormat("%.2f", cfg.alignment_weight), &cfg.alignment_weight, 0.0f, 2.0f);
+            
+            sY += space;
+            GuiSliderBar((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH }, "Cohesion", TextFormat("%.2f", cfg.cohesion_weight), &cfg.cohesion_weight, 0.0f, 2.0f);
+            
+            sY += space;
+            GuiSliderBar((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH }, "Wander", TextFormat("%.2f", cfg.wander_weight), &cfg.wander_weight, 0.0f, 1.0f);
+            
+            sY += space;
+            GuiSliderBar((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH }, "Urgency", TextFormat("%.2f", cfg.urgency_multiplier), &cfg.urgency_multiplier, 0.01f, 1.0f);
+            
+            sY += space;
+            GuiSliderBar((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH }, "Agility", TextFormat("%.1f", cfg.agility), &cfg.agility, 0.1f, 10.0f);
+
+            // Comportamiento de bordes
+            sY += space;
+            bool isWrap = (cfg.boundary_mode == BOUNDARY_WRAP);
+            GuiCheckBox((Rectangle){ (float)sX, (float)sY, 15, 15 }, "Boundary: WRAP (B to swap)", &isWrap);
+            cfg.boundary_mode = isWrap ? BOUNDARY_WRAP : BOUNDARY_BOUNCE;
         }
 
         DrawFPS(10, 10);
