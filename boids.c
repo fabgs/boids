@@ -5,6 +5,9 @@
 #include "raylib.h"
 #include "raymath.h"
 
+#define RAYGUI_IMPLEMENTATION
+#include "raygui.h"
+
 typedef enum {
     BOUNDARY_BOUNCE,
     BOUNDARY_WRAP
@@ -41,6 +44,7 @@ typedef struct{
     float alignment_weight; // peso de la fuerza de alineación
     float cohesion_weight; // peso de la fuerza de cohesión
     float wander_weight; // peso de aleatoriedad de movimiento
+    float urgency_multiplier; // para que aceleren por distintos factores
     float agility; // facilidad para girar y frenar
     float noise_table[1024];
     boundary_mode boundary_mode;
@@ -351,13 +355,25 @@ void boids_compute_accelerations(boid *boids, const config *cfg, const spatial_g
         if (total_neighbors > 0) desired_dir = vec3_add(desired_dir, vec3_scale(separation, cfg->separation_weight));
         if (visual_neighbors > 0) desired_dir = vec3_add(desired_dir, vec3_scale(alignment, cfg->alignment_weight));
         if (visual_neighbors > 0) desired_dir = vec3_add(desired_dir, vec3_scale(cohesion, cfg->cohesion_weight));
-        // acelero si hay grupo y freno si estoy solo
-        float target_speed = (total_neighbors > 0) ? cfg->max_speed : cfg->min_speed;
-        
+
         float dir_len = sqrtf(vec3_length2(desired_dir));
         if (dir_len > 0.001f) {
-            vec3 desired_vel = vec3_scale(desired_dir, target_speed / dir_len);
+            // Normalizamos la dirección para saber hacia donde ir
+            vec3 dir_norm = vec3_scale(desired_dir, 1.0f / dir_len);
+
+            // Usamos el multiplicador desde la configuración
+            float urgency = dir_len * cfg->urgency_multiplier;
             
+            // Limitamos la urgencia entre 0.0 y 1.0
+            if (urgency > 1.0f) urgency = 1.0f;
+            
+            // Interpolar entre la velocidad de relax y la de pánico
+            float target_speed = cfg->min_speed + (cfg->max_speed - cfg->min_speed) * urgency;
+
+            // Calculamos el vector de velocidad deseado final
+            vec3 desired_vel = vec3_scale(dir_norm, target_speed);
+            
+            // Aplicamos el Steering
             observer->acceleration.x += (desired_vel.x - observer->velocity.x) * cfg->agility;
             observer->acceleration.y += (desired_vel.y - observer->velocity.y) * cfg->agility;
             observer->acceleration.z += (desired_vel.z - observer->velocity.z) * cfg->agility;
@@ -423,6 +439,7 @@ int main() {
         .alignment_weight = 0.3f,
         .cohesion_weight = 0.5f,
         .wander_weight = 0.1f,
+        .urgency_multiplier = 0.5f,
         .agility = 5.0f,
         .boundary_mode = BOUNDARY_WRAP,
     };
@@ -451,9 +468,13 @@ int main() {
     //generación del grid
     spatial_grid grid = spatial_grid_init(&cfg);
 
+    bool show_ui = true;
+
     InitWindow(1920, 1080, "Boids 3D");
     SetTargetFPS(60);
-    DisableCursor();
+
+    if (show_ui) EnableCursor();
+    else DisableCursor();
 
     //creo un cono para un boid
     Mesh boidMesh = GenMeshCone(0.18f, 0.6f, 8);
@@ -504,13 +525,20 @@ int main() {
         if (IsKeyDown(KEY_SPACE)) movement.z += cam_speed; 
         if (IsKeyDown(KEY_LEFT_SHIFT)) movement.z -= cam_speed; 
 
-        // rotación con el ratón
-        Vector2 mouseDelta = GetMouseDelta();
-        Vector3 rotation = {
-            mouseDelta.x * 0.1f, // Sensibilidad X
-            mouseDelta.y * 0.1f, // Sensibilidad Y
-            0.0f
-        };
+        // desactivar ui
+        if (IsKeyPressed(KEY_TAB)) {
+            show_ui = !show_ui;
+            if (show_ui) EnableCursor();
+            else DisableCursor();
+        }
+
+        // rotación con el ratón (solo si la ui esta oculta)
+        Vector3 rotation = {0};
+        if (!show_ui) {
+            Vector2 mouseDelta = GetMouseDelta();
+            rotation.x = mouseDelta.x * 0.1f;
+            rotation.y = mouseDelta.y * 0.1f;
+        }
 
         // zoom con la rueda
         float zoom = GetMouseWheelMove() * 2.0f;
@@ -568,6 +596,28 @@ int main() {
         DrawMeshInstanced(boidMesh, boidMaterial, boidTransforms, cfg.num_boids);
 
         EndMode3D();
+
+        if (show_ui) {
+            // Fondo semitransparente para que se lean bien las letras
+            DrawRectangle(10, 10, 320, 390, Fade(BLACK, 0.7f));
+            GuiPanel((Rectangle){ 10, 10, 320, 390 }, "LEYES DE LA FISICA (Pulsa TAB para volar)");
+
+            // Sliders que modifican tu struct directamente
+            GuiSlider((Rectangle){ 120, 50, 150, 20 }, "Min Speed", NULL, &cfg.min_speed, 1.0f, 20.0f);
+            GuiSlider((Rectangle){ 120, 80, 150, 20 }, "Max Speed", NULL, &cfg.max_speed, 10.0f, 50.0f);
+            GuiSlider((Rectangle){ 120, 110, 150, 20 }, "Vision Radius", NULL, &cfg.vision_radius, 1.0f, 50.0f);
+            
+            // Slider del ángulo ciego + ¡Recálculo del coseno en vivo!
+            GuiSlider((Rectangle){ 120, 140, 150, 20 }, "Blind Angle", NULL, &cfg.blind_angle, 0.0f, PI);
+            cfg.cos_blind_angle = cosf(PI - cfg.blind_angle); 
+
+            GuiSlider((Rectangle){ 120, 170, 150, 20 }, "Separation", NULL, &cfg.separation_weight, 0.0f, 2.0f);
+            GuiSlider((Rectangle){ 120, 200, 150, 20 }, "Alignment", NULL, &cfg.alignment_weight, 0.0f, 2.0f);
+            GuiSlider((Rectangle){ 120, 230, 150, 20 }, "Cohesion", NULL, &cfg.cohesion_weight, 0.0f, 2.0f);
+            GuiSlider((Rectangle){ 120, 260, 150, 20 }, "Wander (Ruido)", NULL, &cfg.wander_weight, 0.0f, 1.0f);
+            GuiSlider((Rectangle){ 120, 290, 150, 20 }, "Urgency", NULL, &cfg.urgency_multiplier, 0.01f, 1.0f);
+            GuiSlider((Rectangle){ 120, 320, 150, 20 }, "Agility", NULL, &cfg.agility, 0.1f, 10.0f);
+        }
 
         DrawFPS(10, 10);
         EndDrawing();
