@@ -63,6 +63,11 @@ typedef struct{
     float agility; // facilidad para girar y frenar
     float noise_table[1024];
     boundary_mode boundary_mode;
+    bool show_grid; // debug: dibujar las celdas ocupadas del grid espacial
+    bool show_vision; // debug: dibujar radio de vision y angulo ciego del boid seguido
+    bool show_world_bounds; // debug: dibujar el cubo de limites del mundo
+    bool show_fps; // debug: mostrar contador de fps
+    bool show_crosshair; // debug: mostrar mirilla central al volar con la ui oculta
 } config;
 
 const char *instancingVS =
@@ -259,7 +264,8 @@ void config_sanitize(config *cfg) {
 }
 
 #define STATE_MAGIC "BSTA"
-#define STATE_VERSION 2
+// v4: la config incluye mas flags de debug (cambia sizeof(config))
+#define STATE_VERSION 4
 
 // cabecera del archivo de snapshot guardado
 typedef struct {
@@ -346,6 +352,11 @@ bool config_save_preset(const config *cfg, const char *filepath) {
     fprintf(f, "urgency_multiplier=%f\n", cfg->urgency_multiplier);
     fprintf(f, "agility=%f\n", cfg->agility);
     fprintf(f, "boundary_mode=%s\n", boundary_mode_to_string(cfg->boundary_mode));
+    fprintf(f, "show_grid=%d\n", cfg->show_grid ? 1 : 0);
+    fprintf(f, "show_vision=%d\n", cfg->show_vision ? 1 : 0);
+    fprintf(f, "show_world_bounds=%d\n", cfg->show_world_bounds ? 1 : 0);
+    fprintf(f, "show_fps=%d\n", cfg->show_fps ? 1 : 0);
+    fprintf(f, "show_crosshair=%d\n", cfg->show_crosshair ? 1 : 0);
 
     fclose(f);
     return true;
@@ -376,6 +387,11 @@ bool config_load_preset(config *cfg, const char *filepath) {
         else if (strcmp(key, "urgency_multiplier") == 0) cfg->urgency_multiplier = (float)atof(value);
         else if (strcmp(key, "agility") == 0) cfg->agility = (float)atof(value);
         else if (strcmp(key, "boundary_mode") == 0) cfg->boundary_mode = boundary_mode_from_string(value);
+        else if (strcmp(key, "show_grid") == 0) cfg->show_grid = (atoi(value) != 0);
+        else if (strcmp(key, "show_vision") == 0) cfg->show_vision = (atoi(value) != 0);
+        else if (strcmp(key, "show_world_bounds") == 0) cfg->show_world_bounds = (atoi(value) != 0);
+        else if (strcmp(key, "show_fps") == 0) cfg->show_fps = (atoi(value) != 0);
+        else if (strcmp(key, "show_crosshair") == 0) cfg->show_crosshair = (atoi(value) != 0);
     }
 
     fclose(f);
@@ -741,9 +757,64 @@ Matrix boid_transform(vec3 pos, vec3 dir) {
     };
 }
 
+// dibuja en modo debug solo las celdas del grid que contienen algun boid
+void debug_draw_grid(const spatial_grid *g) {
+    for (int cz = 0; cz < g->cells_z; cz++) {
+        for (int cy = 0; cy < g->cells_y; cy++) {
+            for (int cx = 0; cx < g->cells_x; cx++) {
+                int cell_idx = cx + cy * g->cells_x + cz * g->cells_x * g->cells_y;
+                if (g->head[cell_idx] == -1) continue;
+
+                Vector3 center = {
+                    (cx + 0.5f) * g->cell_size - g->world_offset,
+                    (cy + 0.5f) * g->cell_size - g->world_offset,
+                    (cz + 0.5f) * g->cell_size - g->world_offset
+                };
+                DrawCubeWires(center, g->cell_size, g->cell_size, g->cell_size, Fade(GREEN, 0.3f));
+            }
+        }
+    }
+}
+
+// dibuja en modo debug el radio de vision y el cono del angulo ciego trasero de un boid
+void debug_draw_vision(const boid *b, const config *cfg) {
+    Vector3 pos = { b->position.x, b->position.y, b->position.z };
+    DrawSphereWires(pos, cfg->vision_radius, 12, 12, Fade(YELLOW, 0.5f));
+
+    if (cfg->blind_angle <= 0.001f) return; // sin angulo ciego no hay cono que dibujar
+
+    vec3 fwd = vec3_normalize(b->velocity);
+    if (vec3_length2(fwd) < 0.5f) return; // boid parado, direccion indefinida
+
+    // base ortonormal alrededor del eje trasero del boid
+    vec3 back = vec3_scale(fwd, -1.0f);
+    vec3 ref = (fabsf(back.y) < 0.99f) ? (vec3){0.0f, 1.0f, 0.0f} : (vec3){1.0f, 0.0f, 0.0f};
+    vec3 u = vec3_normalize(vec3_cross(back, ref));
+    vec3 v = vec3_cross(back, u);
+
+    // anillo donde el cono ciego corta la esfera de vision
+    float ring_dist = cfg->vision_radius * cosf(cfg->blind_angle);
+    float ring_radius = cfg->vision_radius * sinf(cfg->blind_angle);
+    vec3 ring_center = vec3_add(b->position, vec3_scale(back, ring_dist));
+
+    const int segments = 24;
+    Vector3 prev = {0};
+    for (int s = 0; s <= segments; s++) {
+        float a = (2.0f * PI * s) / segments;
+        vec3 offset = vec3_add(vec3_scale(u, cosf(a) * ring_radius), vec3_scale(v, sinf(a) * ring_radius));
+        vec3 p = vec3_add(ring_center, offset);
+        Vector3 point = { p.x, p.y, p.z };
+
+        if (s > 0) DrawLine3D(prev, point, RED);
+        // generatrices del cono desde el boid hasta el anillo
+        if (s % 4 == 0) DrawLine3D(pos, point, Fade(RED, 0.6f));
+        prev = point;
+    }
+}
+
 // dimensiones del panel de la ui (tambien usadas para ignorar los clics de seleccion sobre el)
 #define UI_PANEL_WIDTH 340
-#define UI_PANEL_HEIGHT 700
+#define UI_PANEL_HEIGHT 910
 
 // tolerancia angular del picking (~1 grado): un boid lejano ocupa un par de pixeles,
 // asi que se acepta todo lo que quede dentro de un pequeño cono alrededor del cursor
@@ -829,6 +900,11 @@ int main() {
         .urgency_multiplier = 0.5f,
         .agility = 5.0f,
         .boundary_mode = BOUNDARY_WRAP,
+        .show_grid = false,
+        .show_vision = false,
+        .show_world_bounds = true,
+        .show_fps = true,
+        .show_crosshair = true,
     };
 
     //calculo del coseno del angulo muerto
@@ -1030,13 +1106,20 @@ int main() {
         // zoom con la rueda
         float zoom = GetMouseWheelMove() * 2.0f;
 
-        // seleccion de boid con clic (solo con la ui visible y fuera del panel)
-        if (show_ui && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
-            Vector2 mouse = GetMousePosition();
-            Rectangle panel_rect = { (float)(GetScreenWidth() - UI_PANEL_WIDTH - 10), 10.0f, (float)UI_PANEL_WIDTH, (float)UI_PANEL_HEIGHT };
+        // seleccion de boid con clic: con la ui visible se usa el cursor (fuera del panel),
+        // con la ui oculta el cursor esta capturado y se apunta con el centro de la pantalla
+        if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+            Vector2 aim = { GetScreenWidth() * 0.5f, GetScreenHeight() * 0.5f };
+            bool can_pick = true;
 
-            if (!CheckCollisionPointRec(mouse, panel_rect)) {
-                int picked = boid_pick_from_ray(GetScreenToWorldRay(mouse, camera), boids, cfg.num_boids);
+            if (show_ui) {
+                aim = GetMousePosition();
+                Rectangle panel_rect = { (float)(GetScreenWidth() - UI_PANEL_WIDTH - 10), 10.0f, (float)UI_PANEL_WIDTH, (float)UI_PANEL_HEIGHT };
+                can_pick = !CheckCollisionPointRec(aim, panel_rect);
+            }
+
+            if (can_pick) {
+                int picked = boid_pick_from_ray(GetScreenToWorldRay(aim, camera), boids, cfg.num_boids);
                 if (picked >= 0) {
                     followed_boid = picked;
                     if (cam_mode == CAM_MODE_FREE) cam_mode = CAM_MODE_THIRD_PERSON;
@@ -1114,18 +1197,34 @@ int main() {
 
         // dibujar el suelo y los limites del mundo
         //DrawGrid(20, 1.0f); //TODO: se dibujara cuando se implemente el grid parametrizado para comprobaciones locales
-        DrawCubeWires(
-            (Vector3){0.0f, 0.0f, 0.0f},
-            cfg.world_size * 2.0f,
-            cfg.world_size * 2.0f,
-            cfg.world_size * 2.0f,
-            GRAY
-        );
+        if (cfg.show_world_bounds) {
+            DrawCubeWires(
+                (Vector3){0.0f, 0.0f, 0.0f},
+                cfg.world_size * 2.0f,
+                cfg.world_size * 2.0f,
+                cfg.world_size * 2.0f,
+                GRAY
+            );
+        }
 
         //dibujado directo de los boids visibles
         if (visible_boids > 0) DrawMeshInstanced(boidMesh, boidMaterial, boidTransforms, visible_boids);
 
+        // overlays de debug: celdas ocupadas del grid y vision del boid seguido
+        if (cfg.show_grid) debug_draw_grid(&grid);
+        if (cfg.show_vision && followed_boid >= 0 && followed_boid < cfg.num_boids) {
+            debug_draw_vision(&boids[followed_boid], &cfg);
+        }
+
         EndMode3D();
+
+        // mirilla de referencia para seleccionar boids con la ui oculta
+        if (!show_ui && cfg.show_crosshair) {
+            int cx = GetScreenWidth() / 2;
+            int cy = GetScreenHeight() / 2;
+            DrawLine(cx - 8, cy, cx + 8, cy, Fade(RAYWHITE, 0.7f));
+            DrawLine(cx, cy - 8, cx, cy + 8, Fade(RAYWHITE, 0.7f));
+        }
 
         if (show_ui) {
             int pW = UI_PANEL_WIDTH;
@@ -1233,6 +1332,8 @@ int main() {
 
             // nombre bajo el que se guardara la config actual como preset, con su boton de guardado al lado
             sY += space + 10;
+            GuiLine((Rectangle){ (float)(pX + 10), (float)(sY - 8), (float)(pW - 20), 10 }, "Preset");
+            sY += space - 10;
             if (GuiTextBox((Rectangle){ (float)sX, (float)sY, (float)rowFieldW, (float)sH }, preset_name_input, FILE_LIST_MAX_NAME, preset_name_edit_mode)) {
                 preset_name_edit_mode = !preset_name_edit_mode;
             }
@@ -1255,6 +1356,8 @@ int main() {
 
             // snapshots: guardan la config y la posicion/velocidad/aceleracion de todos los boids con nombre propio para retomar la simulacion despues
             sY += space + 10;
+            GuiLine((Rectangle){ (float)(pX + 10), (float)(sY - 8), (float)(pW - 20), 10 }, "Snapshot");
+            sY += space - 10;
             if (GuiTextBox((Rectangle){ (float)sX, (float)sY, (float)rowFieldW, (float)sH }, snapshot_name_input, FILE_LIST_MAX_NAME, snapshot_name_edit_mode)) {
                 snapshot_name_edit_mode = !snapshot_name_edit_mode;
             }
@@ -1274,6 +1377,20 @@ int main() {
                 if (boids_load_state(boids, &cfg, &sim_time, filepath)) transforms_dirty = true;
             }
 
+            // seccion de debug: overlays de visualizacion en tiempo real
+            sY += space + 10;
+            GuiLine((Rectangle){ (float)(pX + 10), (float)(sY - 8), (float)(pW - 20), 10 }, "Debug");
+            sY += space - 10;
+            GuiCheckBox((Rectangle){ (float)sX, (float)sY, 15, 15 }, "Show Grid Cells", &cfg.show_grid);
+            sY += space;
+            GuiCheckBox((Rectangle){ (float)sX, (float)sY, 15, 15 }, "Show Vision (followed boid)", &cfg.show_vision);
+            sY += space;
+            GuiCheckBox((Rectangle){ (float)sX, (float)sY, 15, 15 }, "Show World Bounds", &cfg.show_world_bounds);
+            sY += space;
+            GuiCheckBox((Rectangle){ (float)sX, (float)sY, 15, 15 }, "Show FPS", &cfg.show_fps);
+            sY += space;
+            GuiCheckBox((Rectangle){ (float)sX, (float)sY, 15, 15 }, "Show Crosshair", &cfg.show_crosshair);
+
             // ambos desplegables se dibujan al final para que sus listas aparezcan por encima del resto de controles
             if (GuiDropdownBox(presetDropdownRect, preset_dropdown_text, &preset_selected, preset_edit_mode)) {
                 preset_edit_mode = !preset_edit_mode;
@@ -1283,7 +1400,7 @@ int main() {
             }
         }
 
-        DrawFPS(10, 10);
+        if (cfg.show_fps) DrawFPS(10, 10);
         EndDrawing();
     }
 
