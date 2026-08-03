@@ -225,6 +225,32 @@ void boids_reset(boid *boids, config *cfg, int seed, float *sim_time){
     *sim_time = 0.0f;
 }
 
+// fuerza un float a un rango valido (NaN o menor cae al minimo)
+float clamp_float(float v, float min_v, float max_v) {
+    if (!(v >= min_v)) return min_v;
+    if (v > max_v) return max_v;
+    return v;
+}
+
+// asegura que una config cargada de disco no tenga valores que rompan la simulacion (division por cero, overflow del grid, NaN)
+// los rangos son los mismos que permiten los sliders de la ui
+void config_sanitize(config *cfg) {
+    if (cfg->num_boids < 0) cfg->num_boids = 0;
+    if (cfg->num_boids > cfg->max_boids) cfg->num_boids = cfg->max_boids;
+    cfg->world_size = clamp_float(cfg->world_size, 50.0f, 400.0f);
+    cfg->min_speed = clamp_float(cfg->min_speed, 1.0f, 20.0f);
+    cfg->max_speed = clamp_float(cfg->max_speed, 10.0f, 50.0f);
+    cfg->vision_radius = clamp_float(cfg->vision_radius, 1.0f, 50.0f);
+    cfg->blind_angle = clamp_float(cfg->blind_angle, 0.0f, PI);
+    cfg->separation_weight = clamp_float(cfg->separation_weight, 0.0f, 2.0f);
+    cfg->alignment_weight = clamp_float(cfg->alignment_weight, 0.0f, 2.0f);
+    cfg->cohesion_weight = clamp_float(cfg->cohesion_weight, 0.0f, 2.0f);
+    cfg->wander_weight = clamp_float(cfg->wander_weight, 0.0f, 1.0f);
+    cfg->urgency_multiplier = clamp_float(cfg->urgency_multiplier, 0.01f, 1.0f);
+    cfg->agility = clamp_float(cfg->agility, 0.1f, 10.0f);
+    cfg->cos_blind_angle = cosf(PI - cfg->blind_angle);
+}
+
 #define STATE_MAGIC "BSTA"
 #define STATE_VERSION 2
 
@@ -274,7 +300,9 @@ bool boids_load_state(boid *boids, config *cfg, float *sim_time, const char *fil
     int max_boids = cfg->max_boids;
     *cfg = loaded_cfg;
     cfg->max_boids = max_boids;
-    cfg->cos_blind_angle = cosf(PI - cfg->blind_angle);
+
+    // un snapshot corrupto no debe poder colar valores que rompan la simulacion
+    config_sanitize(cfg);
 
     *sim_time = header.sim_time;
     return true;
@@ -345,11 +373,9 @@ bool config_load_preset(config *cfg, const char *filepath) {
 
     fclose(f);
 
-    // recalcular el valor derivado del angulo ciego
-    cfg->cos_blind_angle = cosf(PI - cfg->blind_angle);
-
-    // el numero de boids no puede superar la memoria reservada
-    if (cfg->num_boids > cfg->max_boids) cfg->num_boids = cfg->max_boids;
+    // recalcula el coseno derivado y clampea todo a rangos validos
+    // (un preset editado a mano podria colar valores que rompan la simulacion)
+    config_sanitize(cfg);
 
     return true;
 }
@@ -377,7 +403,10 @@ int refresh_file_list(const char *dir, const char *extension, char names[][FILE_
 
     UnloadDirectoryFiles(files);
 
-    if (count == 0) strncpy(dropdown_text, empty_message, dropdown_text_size - 1);
+    if (count == 0) {
+        strncpy(dropdown_text, empty_message, dropdown_text_size - 1);
+        dropdown_text[dropdown_text_size - 1] = '\0';
+    }
 
     return count;
 }
@@ -560,17 +589,28 @@ void boids_compute_accelerations(boid *boids, const config *cfg, const spatial_g
     }
 }
 
+// limite de celdas por eje para que el grid no pida gigas de memoria con mundos grandes y radios de vision pequeños
+// (celdas mas grandes que el radio de vision siguen dando resultados correctos, solo son menos eficientes)
+#define GRID_MAX_CELLS_PER_AXIS 128
+
+// calcula tamaño de celda y numero de celdas por eje a partir de la config actual
+void grid_compute_dims(spatial_grid *g, const config *cfg) {
+    g->cell_size = cfg->vision_radius;
+
+    float min_cell = (2.0f * cfg->world_size) / GRID_MAX_CELLS_PER_AXIS;
+    if (g->cell_size < min_cell) g->cell_size = min_cell;
+
+    g->cells_x = (int)((2.0f * cfg->world_size) / g->cell_size) + 1;
+    g->cells_y = g->cells_x;
+    g->cells_z = g->cells_x;
+    g->world_offset = cfg->world_size;
+}
+
 spatial_grid spatial_grid_init(const config *cfg){
     spatial_grid g;
-    g.cell_size = cfg->vision_radius;
-
-    //numero de celdas por dimension
-    g.cells_x = (int)((2.0f * cfg->world_size) / g.cell_size) + 1;
-    g.cells_y = g.cells_x;
-    g.cells_z = g.cells_x;
+    grid_compute_dims(&g, cfg);
     g.total_cells = g.cells_x*g.cells_y*g.cells_z;
     g.allocated_cells = g.total_cells;
-    g.world_offset = cfg->world_size;
 
     g.head = malloc(g.allocated_cells * sizeof(int));
     g.next = malloc(cfg->max_boids * sizeof(int));
@@ -581,16 +621,17 @@ spatial_grid spatial_grid_init(const config *cfg){
 // actualizador de posiciones de boids en el grid
 void grid_build(spatial_grid *g, const boid *boids, const config *cfg) {
     // Recalcular parametros por si el usuario ha movido el slider
-    g->cell_size = cfg->vision_radius;
-    g->cells_x = (int)((2.0f * cfg->world_size) / g->cell_size) + 1;
-    g->cells_y = g->cells_x;
-    g->cells_z = g->cells_x;
+    grid_compute_dims(g, cfg);
     int new_total = g->cells_x * g->cells_y * g->cells_z;
-    g->world_offset = cfg->world_size;
 
     // si el nuevo mundo necesita más celdas de las que tenemos se amplia memoria
     if (new_total > g->allocated_cells) {
-        g->head = realloc(g->head, new_total * sizeof(int));
+        int *new_head = realloc(g->head, new_total * sizeof(int));
+        if (new_head == NULL) {
+            fprintf(stderr, "boids: sin memoria para el grid espacial (%d celdas)\n", new_total);
+            exit(1);
+        }
+        g->head = new_head;
         g->allocated_cells = new_total;
     }
     g->total_cells = new_total;
@@ -739,6 +780,9 @@ int main() {
     //generación del grid
     spatial_grid grid = spatial_grid_init(&cfg);
 
+    //check null de las reservas del grid
+    if (grid.head == NULL || grid.next == NULL) return 1;
+
     bool show_ui = true;
     bool is_paused = false;
     bool seed_edit_mode = false;
@@ -822,6 +866,12 @@ int main() {
 
     //reserva de memoria
     Matrix *boidTransforms = malloc(sizeof(Matrix) * cfg.max_boids);
+
+    //check null de la asignacion anterior
+    if (boidTransforms == NULL) {
+        CloseWindow();
+        return 1;
+    }
 
     Camera3D camera = {0};
     camera.position = (Vector3){cfg.world_size+10.0f, cfg.world_size+10.0f, cfg.world_size+10.0f};
