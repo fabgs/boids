@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
+#include <string.h>
 #include "vec3.h"
 #include "raylib.h"
 #include "raymath.h"
@@ -222,6 +223,107 @@ void boids_reset(boid *boids, config *cfg, int seed, float *sim_time){
     }
     boids_init(boids, cfg);
     *sim_time = 0.0f;
+}
+
+#define PRESET_MAX_COUNT 64
+#define PRESET_MAX_NAME 64
+
+// convierte el modo de borde a texto para guardarlo en el archivo
+const char *boundary_mode_to_string(boundary_mode mode) {
+    return (mode == BOUNDARY_WRAP) ? "WRAP" : "BOUNCE";
+}
+
+// convierte el texto leido del archivo al modo de borde correspondiente
+boundary_mode boundary_mode_from_string(const char *text) {
+    return (strcmp(text, "WRAP") == 0) ? BOUNDARY_WRAP : BOUNDARY_BOUNCE;
+}
+
+// exporta a un archivo de texto los parametros de la config ajustables desde la ui
+bool config_save_preset(const config *cfg, const char *filepath) {
+    FILE *f = fopen(filepath, "w");
+    if (f == NULL) return false;
+
+    fprintf(f, "num_boids=%d\n", cfg->num_boids);
+    fprintf(f, "world_size=%f\n", cfg->world_size);
+    fprintf(f, "min_speed=%f\n", cfg->min_speed);
+    fprintf(f, "max_speed=%f\n", cfg->max_speed);
+    fprintf(f, "vision_radius=%f\n", cfg->vision_radius);
+    fprintf(f, "blind_angle=%f\n", cfg->blind_angle);
+    fprintf(f, "separation_weight=%f\n", cfg->separation_weight);
+    fprintf(f, "alignment_weight=%f\n", cfg->alignment_weight);
+    fprintf(f, "cohesion_weight=%f\n", cfg->cohesion_weight);
+    fprintf(f, "wander_weight=%f\n", cfg->wander_weight);
+    fprintf(f, "urgency_multiplier=%f\n", cfg->urgency_multiplier);
+    fprintf(f, "agility=%f\n", cfg->agility);
+    fprintf(f, "boundary_mode=%s\n", boundary_mode_to_string(cfg->boundary_mode));
+
+    fclose(f);
+    return true;
+}
+
+// sobreescribe la config actual con los valores leidos de un archivo de preset
+bool config_load_preset(config *cfg, const char *filepath) {
+    FILE *f = fopen(filepath, "r");
+    if (f == NULL) return false;
+
+    char key[64];
+    char value[64];
+    char line[128];
+
+    while (fgets(line, sizeof(line), f) != NULL) {
+        if (sscanf(line, "%63[^=]=%63s", key, value) != 2) continue;
+
+        if (strcmp(key, "num_boids") == 0) cfg->num_boids = atoi(value);
+        else if (strcmp(key, "world_size") == 0) cfg->world_size = (float)atof(value);
+        else if (strcmp(key, "min_speed") == 0) cfg->min_speed = (float)atof(value);
+        else if (strcmp(key, "max_speed") == 0) cfg->max_speed = (float)atof(value);
+        else if (strcmp(key, "vision_radius") == 0) cfg->vision_radius = (float)atof(value);
+        else if (strcmp(key, "blind_angle") == 0) cfg->blind_angle = (float)atof(value);
+        else if (strcmp(key, "separation_weight") == 0) cfg->separation_weight = (float)atof(value);
+        else if (strcmp(key, "alignment_weight") == 0) cfg->alignment_weight = (float)atof(value);
+        else if (strcmp(key, "cohesion_weight") == 0) cfg->cohesion_weight = (float)atof(value);
+        else if (strcmp(key, "wander_weight") == 0) cfg->wander_weight = (float)atof(value);
+        else if (strcmp(key, "urgency_multiplier") == 0) cfg->urgency_multiplier = (float)atof(value);
+        else if (strcmp(key, "agility") == 0) cfg->agility = (float)atof(value);
+        else if (strcmp(key, "boundary_mode") == 0) cfg->boundary_mode = boundary_mode_from_string(value);
+    }
+
+    fclose(f);
+
+    // recalcular el valor derivado del angulo ciego
+    cfg->cos_blind_angle = cosf(PI - cfg->blind_angle);
+
+    // el numero de boids no puede superar la memoria reservada
+    if (cfg->num_boids > cfg->max_boids) cfg->num_boids = cfg->max_boids;
+
+    return true;
+}
+
+// escanea una carpeta en busca de archivos .cfg y construye la lista de nombres y el texto del desplegable
+int presets_refresh(const char *dir, char names[][PRESET_MAX_NAME], char *dropdown_text, int dropdown_text_size) {
+    dropdown_text[0] = '\0';
+    int count = 0;
+
+    if (!DirectoryExists(dir)) return 0;
+
+    FilePathList files = LoadDirectoryFilesEx(dir, ".cfg", false);
+
+    for (unsigned int i = 0; i < files.count && count < PRESET_MAX_COUNT; i++) {
+        const char *name = GetFileNameWithoutExt(files.paths[i]);
+
+        if (count > 0) strncat(dropdown_text, ";", dropdown_text_size - strlen(dropdown_text) - 1);
+        strncat(dropdown_text, name, dropdown_text_size - strlen(dropdown_text) - 1);
+
+        strncpy(names[count], name, PRESET_MAX_NAME - 1);
+        names[count][PRESET_MAX_NAME - 1] = '\0';
+        count++;
+    }
+
+    UnloadDirectoryFiles(files);
+
+    if (count == 0) strncpy(dropdown_text, "(sin presets)", dropdown_text_size - 1);
+
+    return count;
 }
 
 // actualización de las posiciones de los boids, recibe array de boids y configuración
@@ -463,6 +565,78 @@ void grid_build(spatial_grid *g, const boid *boids, const config *cfg) {
     }
 }
 
+// mismos planos de recorte que usa raylib por defecto
+#define CAMERA_NEAR_PLANE 0.01f
+#define CAMERA_FAR_PLANE 1000.0f
+// esfera que envuelve el cono del boid para el culling
+#define BOID_BOUNDING_RADIUS 0.7f
+
+// los 6 planos (a,b,c,d) del volumen visible de la camara
+typedef struct {
+    float planes[6][4];
+} frustum;
+
+// extrae los planos del frustum de la matriz vista*proyeccion (metodo gribb-hartmann)
+frustum frustum_from_view_projection(Matrix m) {
+    float rows[4][4] = {
+        {m.m0, m.m4, m.m8,  m.m12},
+        {m.m1, m.m5, m.m9,  m.m13},
+        {m.m2, m.m6, m.m10, m.m14},
+        {m.m3, m.m7, m.m11, m.m15}
+    };
+
+    frustum f;
+    for (int i = 0; i < 6; i++) {
+        int axis = i / 2; // 0 = x (izq/der), 1 = y (abajo/arriba), 2 = z (cerca/lejos)
+        float sign = (i % 2 == 0) ? 1.0f : -1.0f;
+
+        for (int c = 0; c < 4; c++) {
+            f.planes[i][c] = rows[3][c] + sign * rows[axis][c];
+        }
+
+        // normalizar el plano para que las distancias sean reales
+        float len = sqrtf(f.planes[i][0] * f.planes[i][0] + f.planes[i][1] * f.planes[i][1] + f.planes[i][2] * f.planes[i][2]);
+        if (len > 0.0f) {
+            for (int c = 0; c < 4; c++) f.planes[i][c] /= len;
+        }
+    }
+
+    return f;
+}
+
+// true si una esfera toca el volumen visible de la camara
+bool frustum_contains_sphere(const frustum *f, vec3 center, float radius) {
+    for (int i = 0; i < 6; i++) {
+        float dist = f->planes[i][0] * center.x + f->planes[i][1] * center.y + f->planes[i][2] * center.z + f->planes[i][3];
+        if (dist < -radius) return false;
+    }
+    return true;
+}
+
+// matriz mundo del boid: orienta el cono (+Y) hacia dir y lo coloca en pos
+// construccion directa (formula de rodrigues) para evitar quaternion + multiplicacion de matrices
+Matrix boid_transform(vec3 pos, vec3 dir) {
+    // caso degenerado: mirar recto hacia abajo (rotacion de 180 grados sobre x)
+    if (dir.y < -0.9999f) {
+        return (Matrix){
+            1.0f,  0.0f,  0.0f, pos.x,
+            0.0f, -1.0f,  0.0f, pos.y,
+            0.0f,  0.0f, -1.0f, pos.z,
+            0.0f,  0.0f,  0.0f, 1.0f
+        };
+    }
+
+    float k = 1.0f / (1.0f + dir.y);
+    float kxz = k * dir.x * dir.z;
+
+    return (Matrix){
+        dir.y + k * dir.z * dir.z,  dir.x,  -kxz,                       pos.x,
+        -dir.x,                     dir.y,  -dir.z,                     pos.y,
+        -kxz,                       dir.z,  dir.y + k * dir.x * dir.x,  pos.z,
+        0.0f,                       0.0f,   0.0f,                       1.0f
+    };
+}
+
 int main() {
     config cfg = {
         .num_boids = 50000,
@@ -513,9 +687,27 @@ int main() {
     bool is_paused = false;
     bool seed_edit_mode = false;
 
+    // carpeta de presets junto al ejecutable
+    char presets_dir[512];
+    snprintf(presets_dir, sizeof(presets_dir), "%spresets", GetApplicationDirectory());
+    if (!DirectoryExists(presets_dir)) MakeDirectory(presets_dir);
+
+    char preset_names[PRESET_MAX_COUNT][PRESET_MAX_NAME];
+    char preset_dropdown_text[1024];
+    int preset_count = presets_refresh(presets_dir, preset_names, preset_dropdown_text, sizeof(preset_dropdown_text));
+    int preset_selected = 0;
+    bool preset_edit_mode = false;
+    char preset_name_input[PRESET_MAX_NAME] = "";
+    bool preset_name_edit_mode = false;
+
     // paso y reloj de la simulación fijos, para que no dependan del framerate real y sea reproducible
     const float sim_dt = 1.0f / 60.0f;
     float sim_time = 0.0f;
+
+    // cache de render: las matrices solo se recalculan si la simulacion avanza o cambia la vista
+    int visible_boids = 0;
+    int prev_num_boids = -1;
+    bool transforms_dirty = true;
 
     InitWindow(1920, 1080, "Boids 3D");
     SetTargetFPS(60);
@@ -572,11 +764,15 @@ int main() {
     while (!WindowShouldClose()) {
         float dt = GetFrameTime();
 
-        simulation_handle_input(&cfg, &is_paused);
+        // mientras se edita un campo de texto, el teclado no debe disparar atajos ni mover la camara
+        bool typing = seed_edit_mode || preset_name_edit_mode;
 
-        // reinicio rápido de la simulación (deshabilitado mientras se edita la semilla)
-        if (IsKeyPressed(KEY_R) && !seed_edit_mode) {
+        if (!typing) simulation_handle_input(&cfg, &is_paused);
+
+        // reinicio rápido de la simulación (deshabilitado mientras se edita algun campo de texto)
+        if (IsKeyPressed(KEY_R) && !typing) {
             boids_reset(boids, &cfg, seed, &sim_time);
+            transforms_dirty = true;
         }
 
         //UpdateCamera(&camera, CAMERA_FREE); //camara antes
@@ -589,17 +785,19 @@ int main() {
         float cam_speed = base_speed * dt;
 
         Vector3 movement = {0};
-        if (IsKeyDown(KEY_W)) movement.x += cam_speed;
-        if (IsKeyDown(KEY_S)) movement.x -= cam_speed;
-        if (IsKeyDown(KEY_D)) movement.y += cam_speed;
-        if (IsKeyDown(KEY_A)) movement.y -= cam_speed;
-        
-        // espacio y shift para subir y bajar
-        if (IsKeyDown(KEY_SPACE)) movement.z += cam_speed; 
-        if (IsKeyDown(KEY_LEFT_SHIFT)) movement.z -= cam_speed; 
+        if (!typing) {
+            if (IsKeyDown(KEY_W)) movement.x += cam_speed;
+            if (IsKeyDown(KEY_S)) movement.x -= cam_speed;
+            if (IsKeyDown(KEY_D)) movement.y += cam_speed;
+            if (IsKeyDown(KEY_A)) movement.y -= cam_speed;
+
+            // espacio y shift para subir y bajar
+            if (IsKeyDown(KEY_SPACE)) movement.z += cam_speed;
+            if (IsKeyDown(KEY_LEFT_SHIFT)) movement.z -= cam_speed;
+        }
 
         // desactivar ui
-        if (IsKeyPressed(KEY_TAB)) {
+        if (IsKeyPressed(KEY_TAB) && !typing) {
             show_ui = !show_ui;
             if (show_ui) EnableCursor();
             else DisableCursor();
@@ -630,26 +828,39 @@ int main() {
             boids_update(boids, &cfg, sim_dt);
         }
 
-        #pragma omp parallel for
-        for (int i = 0; i < cfg.num_boids; i++) {
-            boid *b = &boids[i];
-            
-            //la dirección en la que vuela el boid normalizada
-            vec3 dir_v = vec3_normalize(b->velocity);
-            Vector3 dir = { dir_v.x, dir_v.y, dir_v.z };
-            
-            //los conos de Raylib se generan mirando hacia arriba
-            Vector3 up_default = { 0.0f, 1.0f, 0.0f };
-            
-            //se calcula como rotar desde arriba hasta donde mira el boid
-            Quaternion q = QuaternionFromVector3ToVector3(up_default, dir);
-            Matrix rot = QuaternionToMatrix(q);
-            
-            //se calcula la matriz de su posicion en el mundo
-            Matrix trans = MatrixTranslate(b->position.x, b->position.y, b->position.z);
-            
-            //multiplicacion de las matrices, primero se rota y luego se translada
-            boidTransforms[i] = MatrixMultiply(rot, trans);
+        // solo se recalculan matrices si los boids se han movido o la vista ha cambiado
+        bool camera_moved = (movement.x != 0.0f) || (movement.y != 0.0f) || (movement.z != 0.0f)
+                         || (rotation.x != 0.0f) || (rotation.y != 0.0f) || (zoom != 0.0f) || IsWindowResized();
+
+        if (!is_paused || camera_moved || cfg.num_boids != prev_num_boids || transforms_dirty) {
+            // planos del frustum para descartar los boids que la camara no ve
+            Matrix view = GetCameraMatrix(camera);
+            float aspect = (float)GetScreenWidth() / (float)GetScreenHeight();
+            Matrix proj = MatrixPerspective(camera.fovy * DEG2RAD, aspect, CAMERA_NEAR_PLANE, CAMERA_FAR_PLANE);
+            frustum fr = frustum_from_view_projection(MatrixMultiply(view, proj));
+
+            visible_boids = 0;
+
+            #pragma omp parallel for
+            for (int i = 0; i < cfg.num_boids; i++) {
+                boid *b = &boids[i];
+
+                if (!frustum_contains_sphere(&fr, b->position, BOID_BOUNDING_RADIUS)) continue;
+
+                //la dirección en la que vuela el boid normalizada
+                vec3 dir = vec3_normalize(b->velocity);
+                Matrix transform = boid_transform(b->position, dir);
+
+                //reservar hueco en el array compactado de boids visibles
+                int slot;
+                #pragma omp atomic capture
+                slot = visible_boids++;
+
+                boidTransforms[slot] = transform;
+            }
+
+            prev_num_boids = cfg.num_boids;
+            transforms_dirty = false;
         }
 
         BeginDrawing();
@@ -667,14 +878,14 @@ int main() {
             GRAY
         );
 
-        //dibujado directo de todos los boids
-        DrawMeshInstanced(boidMesh, boidMaterial, boidTransforms, cfg.num_boids);
+        //dibujado directo de los boids visibles
+        if (visible_boids > 0) DrawMeshInstanced(boidMesh, boidMaterial, boidTransforms, visible_boids);
 
         EndMode3D();
 
         if (show_ui) {
             int pW = 340;
-            int pH = 520;
+            int pH = 610;
             
             // Ancho total de pantalla, menos el ancho del panel, menos 10 píxeles de margen
             int pX = GetScreenWidth() - pW - 10; 
@@ -750,6 +961,36 @@ int main() {
             sY += space;
             if (GuiButton((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH + 10 }, "Reset Simulation (R)")) {
                 boids_reset(boids, &cfg, seed, &sim_time);
+                transforms_dirty = true;
+            }
+
+            // nombre bajo el que se guardara la config actual como preset
+            sY += space + 10;
+            if (GuiTextBox((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH }, preset_name_input, PRESET_MAX_NAME, preset_name_edit_mode)) {
+                preset_name_edit_mode = !preset_name_edit_mode;
+            }
+
+            sY += space;
+            if (GuiButton((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH + 10 }, "Save Preset") && preset_name_input[0] != '\0') {
+                char filepath[600];
+                snprintf(filepath, sizeof(filepath), "%s/%s.cfg", presets_dir, preset_name_input);
+                config_save_preset(&cfg, filepath);
+                preset_count = presets_refresh(presets_dir, preset_names, preset_dropdown_text, sizeof(preset_dropdown_text));
+                if (preset_selected >= preset_count) preset_selected = (preset_count > 0) ? preset_count - 1 : 0;
+            }
+
+            sY += space;
+            if (GuiButton((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH + 10 }, "Load Preset") && preset_count > 0) {
+                char filepath[600];
+                snprintf(filepath, sizeof(filepath), "%s/%s.cfg", presets_dir, preset_names[preset_selected]);
+                config_load_preset(&cfg, filepath);
+            }
+
+            // el desplegable se guarda para dibujarlo el ultimo y que su lista aparezca por encima del resto de controles
+            sY += space;
+            Rectangle presetDropdownRect = { (float)sX, (float)sY, (float)sW, (float)sH };
+            if (GuiDropdownBox(presetDropdownRect, preset_dropdown_text, &preset_selected, preset_edit_mode)) {
+                preset_edit_mode = !preset_edit_mode;
             }
         }
 
