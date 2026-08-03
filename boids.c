@@ -84,13 +84,17 @@ float rand_range(float a, float b){
 }
 
 // para cambiar el comportamiento con respecto a los limites
-void simulation_handle_input(config *cfg) {
+void simulation_handle_input(config *cfg, bool *is_paused) {
     if (IsKeyPressed(KEY_B)) {
         if (cfg->boundary_mode == BOUNDARY_BOUNCE) {
             cfg->boundary_mode = BOUNDARY_WRAP;
         } else {
             cfg->boundary_mode = BOUNDARY_BOUNCE;
         }
+    }
+
+    if (IsKeyPressed(KEY_P)) {
+        *is_paused = !*is_paused;
     }
 }
 
@@ -493,6 +497,7 @@ int main() {
     spatial_grid grid = spatial_grid_init(&cfg);
 
     bool show_ui = true;
+    bool is_paused = false;
 
     InitWindow(1920, 1080, "Boids 3D");
     SetTargetFPS(60);
@@ -549,7 +554,7 @@ int main() {
     while (!WindowShouldClose()) {
         float dt = GetFrameTime();
 
-        simulation_handle_input(&cfg);
+        simulation_handle_input(&cfg, &is_paused);
 
         //UpdateCamera(&camera, CAMERA_FREE); //camara antes
         //velocidad de la camara
@@ -591,14 +596,16 @@ int main() {
         // se pasa el calculo a update camera
         UpdateCameraPro(&camera, movement, rotation, zoom);
 
-        //rellenar grid
-        grid_build(&grid, boids, &cfg);
-        //tiempo actual
-        float time_sec = (float)GetTime();
-        //calculo de reglas (separacion, alineacion, cohesion)
-        boids_compute_accelerations(boids, &cfg, &grid, time_sec);
-        //actualizacion de boids
-        boids_update(boids, &cfg, dt);
+        if (!is_paused) {
+            //rellenar grid
+            grid_build(&grid, boids, &cfg);
+            //tiempo actual
+            float time_sec = (float)GetTime();
+            //calculo de reglas (separacion, alineacion, cohesion)
+            boids_compute_accelerations(boids, &cfg, &grid, time_sec);
+            //actualizacion de boids
+            boids_update(boids, &cfg, dt);
+        }
 
         #pragma omp parallel for
         for (int i = 0; i < cfg.num_boids; i++) {
@@ -705,6 +712,10 @@ int main() {
             bool isWrap = (cfg.boundary_mode == BOUNDARY_WRAP);
             GuiCheckBox((Rectangle){ (float)sX, (float)sY, 15, 15 }, "Boundary: WRAP (B to swap)", &isWrap);
             cfg.boundary_mode = isWrap ? BOUNDARY_WRAP : BOUNDARY_BOUNCE;
+
+            // pausar/reanudar la simulacion
+            sY += space;
+            GuiCheckBox((Rectangle){ (float)sX, (float)sY, 15, 15 }, "Paused (P to toggle)", &is_paused);
         }
 
         DrawFPS(10, 10);
