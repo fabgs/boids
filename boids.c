@@ -6,7 +6,12 @@
 #include "raymath.h"
 
 #define RAYGUI_IMPLEMENTATION
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+#pragma GCC diagnostic ignored "-Wunused-parameter"
+#pragma GCC diagnostic ignored "-Wimplicit-fallthrough"
 #include "raygui.h"
+#pragma GCC diagnostic pop
 
 typedef enum {
     BOUNDARY_BOUNCE,
