@@ -475,13 +475,16 @@ int main() {
     //calculo del coseno del angulo muerto
     cfg.cos_blind_angle = cosf(PI - cfg.blind_angle);
 
+    // semilla configurable desde la ui
+    int seed = 1;
+
+    // semilla aleatoria
+    srand(seed);
+
     // calculo de una tabla de aleatoriedad para no hacer calculos con el ruido
     for (int i = 0; i < 1024; i++) {
         cfg.noise_table[i] = rand_range(-1.0f, 1.0f);
     }
-
-    // semilla aleatoria
-    srand(1);
 
     // array dinamico para los boids
     boid *boids = malloc(sizeof(boid) * cfg.max_boids);
@@ -498,6 +501,11 @@ int main() {
 
     bool show_ui = true;
     bool is_paused = false;
+    bool seed_edit_mode = false;
+
+    // paso y reloj de la simulación fijos, para que no dependan del framerate real y sea reproducible
+    const float sim_dt = 1.0f / 60.0f;
+    float sim_time = 0.0f;
 
     InitWindow(1920, 1080, "Boids 3D");
     SetTargetFPS(60);
@@ -599,12 +607,12 @@ int main() {
         if (!is_paused) {
             //rellenar grid
             grid_build(&grid, boids, &cfg);
-            //tiempo actual
-            float time_sec = (float)GetTime();
+            //avanzar el reloj de simulación con un paso fijo (no el tiempo real de reloj)
+            sim_time += sim_dt;
             //calculo de reglas (separacion, alineacion, cohesion)
-            boids_compute_accelerations(boids, &cfg, &grid, time_sec);
+            boids_compute_accelerations(boids, &cfg, &grid, sim_time);
             //actualizacion de boids
-            boids_update(boids, &cfg, dt);
+            boids_update(boids, &cfg, sim_dt);
         }
 
         #pragma omp parallel for
@@ -651,7 +659,7 @@ int main() {
 
         if (show_ui) {
             int pW = 340;
-            int pH = 450;
+            int pH = 520;
             
             // Ancho total de pantalla, menos el ancho del panel, menos 10 píxeles de margen
             int pX = GetScreenWidth() - pW - 10; 
@@ -716,6 +724,23 @@ int main() {
             // pausar/reanudar la simulacion
             sY += space;
             GuiCheckBox((Rectangle){ (float)sX, (float)sY, 15, 15 }, "Paused (P to toggle)", &is_paused);
+
+            // semilla del rng
+            sY += space;
+            if (GuiValueBox((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH }, "Seed", &seed, 0, 999999, seed_edit_mode)) {
+                seed_edit_mode = !seed_edit_mode;
+            }
+
+            // reset de la simulacion con la semilla actual
+            sY += space;
+            if (GuiButton((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH + 10 }, "Reset Simulation")) {
+                srand(seed);
+                for (int i = 0; i < 1024; i++) {
+                    cfg.noise_table[i] = rand_range(-1.0f, 1.0f);
+                }
+                boids_init(boids, &cfg);
+                sim_time = 0.0f;
+            }
         }
 
         DrawFPS(10, 10);
