@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
+#include <string.h>
 #include "vec3.h"
 #include "raylib.h"
 #include "raymath.h"
@@ -222,6 +223,107 @@ void boids_reset(boid *boids, config *cfg, int seed, float *sim_time){
     }
     boids_init(boids, cfg);
     *sim_time = 0.0f;
+}
+
+#define PRESET_MAX_COUNT 64
+#define PRESET_MAX_NAME 64
+
+// convierte el modo de borde a texto para guardarlo en el archivo
+const char *boundary_mode_to_string(boundary_mode mode) {
+    return (mode == BOUNDARY_WRAP) ? "WRAP" : "BOUNCE";
+}
+
+// convierte el texto leido del archivo al modo de borde correspondiente
+boundary_mode boundary_mode_from_string(const char *text) {
+    return (strcmp(text, "WRAP") == 0) ? BOUNDARY_WRAP : BOUNDARY_BOUNCE;
+}
+
+// exporta a un archivo de texto los parametros de la config ajustables desde la ui
+bool config_save_preset(const config *cfg, const char *filepath) {
+    FILE *f = fopen(filepath, "w");
+    if (f == NULL) return false;
+
+    fprintf(f, "num_boids=%d\n", cfg->num_boids);
+    fprintf(f, "world_size=%f\n", cfg->world_size);
+    fprintf(f, "min_speed=%f\n", cfg->min_speed);
+    fprintf(f, "max_speed=%f\n", cfg->max_speed);
+    fprintf(f, "vision_radius=%f\n", cfg->vision_radius);
+    fprintf(f, "blind_angle=%f\n", cfg->blind_angle);
+    fprintf(f, "separation_weight=%f\n", cfg->separation_weight);
+    fprintf(f, "alignment_weight=%f\n", cfg->alignment_weight);
+    fprintf(f, "cohesion_weight=%f\n", cfg->cohesion_weight);
+    fprintf(f, "wander_weight=%f\n", cfg->wander_weight);
+    fprintf(f, "urgency_multiplier=%f\n", cfg->urgency_multiplier);
+    fprintf(f, "agility=%f\n", cfg->agility);
+    fprintf(f, "boundary_mode=%s\n", boundary_mode_to_string(cfg->boundary_mode));
+
+    fclose(f);
+    return true;
+}
+
+// sobreescribe la config actual con los valores leidos de un archivo de preset
+bool config_load_preset(config *cfg, const char *filepath) {
+    FILE *f = fopen(filepath, "r");
+    if (f == NULL) return false;
+
+    char key[64];
+    char value[64];
+    char line[128];
+
+    while (fgets(line, sizeof(line), f) != NULL) {
+        if (sscanf(line, "%63[^=]=%63s", key, value) != 2) continue;
+
+        if (strcmp(key, "num_boids") == 0) cfg->num_boids = atoi(value);
+        else if (strcmp(key, "world_size") == 0) cfg->world_size = (float)atof(value);
+        else if (strcmp(key, "min_speed") == 0) cfg->min_speed = (float)atof(value);
+        else if (strcmp(key, "max_speed") == 0) cfg->max_speed = (float)atof(value);
+        else if (strcmp(key, "vision_radius") == 0) cfg->vision_radius = (float)atof(value);
+        else if (strcmp(key, "blind_angle") == 0) cfg->blind_angle = (float)atof(value);
+        else if (strcmp(key, "separation_weight") == 0) cfg->separation_weight = (float)atof(value);
+        else if (strcmp(key, "alignment_weight") == 0) cfg->alignment_weight = (float)atof(value);
+        else if (strcmp(key, "cohesion_weight") == 0) cfg->cohesion_weight = (float)atof(value);
+        else if (strcmp(key, "wander_weight") == 0) cfg->wander_weight = (float)atof(value);
+        else if (strcmp(key, "urgency_multiplier") == 0) cfg->urgency_multiplier = (float)atof(value);
+        else if (strcmp(key, "agility") == 0) cfg->agility = (float)atof(value);
+        else if (strcmp(key, "boundary_mode") == 0) cfg->boundary_mode = boundary_mode_from_string(value);
+    }
+
+    fclose(f);
+
+    // recalcular el valor derivado del angulo ciego
+    cfg->cos_blind_angle = cosf(PI - cfg->blind_angle);
+
+    // el numero de boids no puede superar la memoria reservada
+    if (cfg->num_boids > cfg->max_boids) cfg->num_boids = cfg->max_boids;
+
+    return true;
+}
+
+// escanea una carpeta en busca de archivos .cfg y construye la lista de nombres y el texto del desplegable
+int presets_refresh(const char *dir, char names[][PRESET_MAX_NAME], char *dropdown_text, int dropdown_text_size) {
+    dropdown_text[0] = '\0';
+    int count = 0;
+
+    if (!DirectoryExists(dir)) return 0;
+
+    FilePathList files = LoadDirectoryFilesEx(dir, ".cfg", false);
+
+    for (unsigned int i = 0; i < files.count && count < PRESET_MAX_COUNT; i++) {
+        const char *name = GetFileNameWithoutExt(files.paths[i]);
+
+        if (count > 0) strncat(dropdown_text, ";", dropdown_text_size - strlen(dropdown_text) - 1);
+        strncat(dropdown_text, name, dropdown_text_size - strlen(dropdown_text) - 1);
+
+        strncpy(names[count], name, PRESET_MAX_NAME - 1);
+        names[count][PRESET_MAX_NAME - 1] = '\0';
+        count++;
+    }
+
+    UnloadDirectoryFiles(files);
+
+    if (count == 0) strncpy(dropdown_text, "(sin presets)", dropdown_text_size - 1);
+
+    return count;
 }
 
 // actualización de las posiciones de los boids, recibe array de boids y configuración
@@ -513,6 +615,19 @@ int main() {
     bool is_paused = false;
     bool seed_edit_mode = false;
 
+    // carpeta de presets junto al ejecutable
+    char presets_dir[512];
+    snprintf(presets_dir, sizeof(presets_dir), "%spresets", GetApplicationDirectory());
+    if (!DirectoryExists(presets_dir)) MakeDirectory(presets_dir);
+
+    char preset_names[PRESET_MAX_COUNT][PRESET_MAX_NAME];
+    char preset_dropdown_text[1024];
+    int preset_count = presets_refresh(presets_dir, preset_names, preset_dropdown_text, sizeof(preset_dropdown_text));
+    int preset_selected = 0;
+    bool preset_edit_mode = false;
+    char preset_name_input[PRESET_MAX_NAME] = "";
+    bool preset_name_edit_mode = false;
+
     // paso y reloj de la simulación fijos, para que no dependan del framerate real y sea reproducible
     const float sim_dt = 1.0f / 60.0f;
     float sim_time = 0.0f;
@@ -572,10 +687,13 @@ int main() {
     while (!WindowShouldClose()) {
         float dt = GetFrameTime();
 
-        simulation_handle_input(&cfg, &is_paused);
+        // mientras se edita un campo de texto, el teclado no debe disparar atajos ni mover la camara
+        bool typing = seed_edit_mode || preset_name_edit_mode;
 
-        // reinicio rápido de la simulación (deshabilitado mientras se edita la semilla)
-        if (IsKeyPressed(KEY_R) && !seed_edit_mode) {
+        if (!typing) simulation_handle_input(&cfg, &is_paused);
+
+        // reinicio rápido de la simulación (deshabilitado mientras se edita algun campo de texto)
+        if (IsKeyPressed(KEY_R) && !typing) {
             boids_reset(boids, &cfg, seed, &sim_time);
         }
 
@@ -589,17 +707,19 @@ int main() {
         float cam_speed = base_speed * dt;
 
         Vector3 movement = {0};
-        if (IsKeyDown(KEY_W)) movement.x += cam_speed;
-        if (IsKeyDown(KEY_S)) movement.x -= cam_speed;
-        if (IsKeyDown(KEY_D)) movement.y += cam_speed;
-        if (IsKeyDown(KEY_A)) movement.y -= cam_speed;
-        
-        // espacio y shift para subir y bajar
-        if (IsKeyDown(KEY_SPACE)) movement.z += cam_speed; 
-        if (IsKeyDown(KEY_LEFT_SHIFT)) movement.z -= cam_speed; 
+        if (!typing) {
+            if (IsKeyDown(KEY_W)) movement.x += cam_speed;
+            if (IsKeyDown(KEY_S)) movement.x -= cam_speed;
+            if (IsKeyDown(KEY_D)) movement.y += cam_speed;
+            if (IsKeyDown(KEY_A)) movement.y -= cam_speed;
+
+            // espacio y shift para subir y bajar
+            if (IsKeyDown(KEY_SPACE)) movement.z += cam_speed;
+            if (IsKeyDown(KEY_LEFT_SHIFT)) movement.z -= cam_speed;
+        }
 
         // desactivar ui
-        if (IsKeyPressed(KEY_TAB)) {
+        if (IsKeyPressed(KEY_TAB) && !typing) {
             show_ui = !show_ui;
             if (show_ui) EnableCursor();
             else DisableCursor();
@@ -674,7 +794,7 @@ int main() {
 
         if (show_ui) {
             int pW = 340;
-            int pH = 520;
+            int pH = 610;
             
             // Ancho total de pantalla, menos el ancho del panel, menos 10 píxeles de margen
             int pX = GetScreenWidth() - pW - 10; 
@@ -750,6 +870,35 @@ int main() {
             sY += space;
             if (GuiButton((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH + 10 }, "Reset Simulation (R)")) {
                 boids_reset(boids, &cfg, seed, &sim_time);
+            }
+
+            // nombre bajo el que se guardara la config actual como preset
+            sY += space + 10;
+            if (GuiTextBox((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH }, preset_name_input, PRESET_MAX_NAME, preset_name_edit_mode)) {
+                preset_name_edit_mode = !preset_name_edit_mode;
+            }
+
+            sY += space;
+            if (GuiButton((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH + 10 }, "Save Preset") && preset_name_input[0] != '\0') {
+                char filepath[600];
+                snprintf(filepath, sizeof(filepath), "%s/%s.cfg", presets_dir, preset_name_input);
+                config_save_preset(&cfg, filepath);
+                preset_count = presets_refresh(presets_dir, preset_names, preset_dropdown_text, sizeof(preset_dropdown_text));
+                if (preset_selected >= preset_count) preset_selected = (preset_count > 0) ? preset_count - 1 : 0;
+            }
+
+            sY += space;
+            if (GuiButton((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH + 10 }, "Load Preset") && preset_count > 0) {
+                char filepath[600];
+                snprintf(filepath, sizeof(filepath), "%s/%s.cfg", presets_dir, preset_names[preset_selected]);
+                config_load_preset(&cfg, filepath);
+            }
+
+            // el desplegable se guarda para dibujarlo el ultimo y que su lista aparezca por encima del resto de controles
+            sY += space;
+            Rectangle presetDropdownRect = { (float)sX, (float)sY, (float)sW, (float)sH };
+            if (GuiDropdownBox(presetDropdownRect, preset_dropdown_text, &preset_selected, preset_edit_mode)) {
+                preset_edit_mode = !preset_edit_mode;
             }
         }
 
