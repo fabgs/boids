@@ -565,6 +565,78 @@ void grid_build(spatial_grid *g, const boid *boids, const config *cfg) {
     }
 }
 
+// mismos planos de recorte que usa raylib por defecto
+#define CAMERA_NEAR_PLANE 0.01f
+#define CAMERA_FAR_PLANE 1000.0f
+// esfera que envuelve el cono del boid para el culling
+#define BOID_BOUNDING_RADIUS 0.7f
+
+// los 6 planos (a,b,c,d) del volumen visible de la camara
+typedef struct {
+    float planes[6][4];
+} frustum;
+
+// extrae los planos del frustum de la matriz vista*proyeccion (metodo gribb-hartmann)
+frustum frustum_from_view_projection(Matrix m) {
+    float rows[4][4] = {
+        {m.m0, m.m4, m.m8,  m.m12},
+        {m.m1, m.m5, m.m9,  m.m13},
+        {m.m2, m.m6, m.m10, m.m14},
+        {m.m3, m.m7, m.m11, m.m15}
+    };
+
+    frustum f;
+    for (int i = 0; i < 6; i++) {
+        int axis = i / 2; // 0 = x (izq/der), 1 = y (abajo/arriba), 2 = z (cerca/lejos)
+        float sign = (i % 2 == 0) ? 1.0f : -1.0f;
+
+        for (int c = 0; c < 4; c++) {
+            f.planes[i][c] = rows[3][c] + sign * rows[axis][c];
+        }
+
+        // normalizar el plano para que las distancias sean reales
+        float len = sqrtf(f.planes[i][0] * f.planes[i][0] + f.planes[i][1] * f.planes[i][1] + f.planes[i][2] * f.planes[i][2]);
+        if (len > 0.0f) {
+            for (int c = 0; c < 4; c++) f.planes[i][c] /= len;
+        }
+    }
+
+    return f;
+}
+
+// true si una esfera toca el volumen visible de la camara
+bool frustum_contains_sphere(const frustum *f, vec3 center, float radius) {
+    for (int i = 0; i < 6; i++) {
+        float dist = f->planes[i][0] * center.x + f->planes[i][1] * center.y + f->planes[i][2] * center.z + f->planes[i][3];
+        if (dist < -radius) return false;
+    }
+    return true;
+}
+
+// matriz mundo del boid: orienta el cono (+Y) hacia dir y lo coloca en pos
+// construccion directa (formula de rodrigues) para evitar quaternion + multiplicacion de matrices
+Matrix boid_transform(vec3 pos, vec3 dir) {
+    // caso degenerado: mirar recto hacia abajo (rotacion de 180 grados sobre x)
+    if (dir.y < -0.9999f) {
+        return (Matrix){
+            1.0f,  0.0f,  0.0f, pos.x,
+            0.0f, -1.0f,  0.0f, pos.y,
+            0.0f,  0.0f, -1.0f, pos.z,
+            0.0f,  0.0f,  0.0f, 1.0f
+        };
+    }
+
+    float k = 1.0f / (1.0f + dir.y);
+    float kxz = k * dir.x * dir.z;
+
+    return (Matrix){
+        dir.y + k * dir.z * dir.z,  dir.x,  -kxz,                       pos.x,
+        -dir.x,                     dir.y,  -dir.z,                     pos.y,
+        -kxz,                       dir.z,  dir.y + k * dir.x * dir.x,  pos.z,
+        0.0f,                       0.0f,   0.0f,                       1.0f
+    };
+}
+
 int main() {
     config cfg = {
         .num_boids = 50000,
@@ -632,6 +704,11 @@ int main() {
     const float sim_dt = 1.0f / 60.0f;
     float sim_time = 0.0f;
 
+    // cache de render: las matrices solo se recalculan si la simulacion avanza o cambia la vista
+    int visible_boids = 0;
+    int prev_num_boids = -1;
+    bool transforms_dirty = true;
+
     InitWindow(1920, 1080, "Boids 3D");
     SetTargetFPS(60);
 
@@ -695,6 +772,7 @@ int main() {
         // reinicio rápido de la simulación (deshabilitado mientras se edita algun campo de texto)
         if (IsKeyPressed(KEY_R) && !typing) {
             boids_reset(boids, &cfg, seed, &sim_time);
+            transforms_dirty = true;
         }
 
         //UpdateCamera(&camera, CAMERA_FREE); //camara antes
@@ -750,26 +828,39 @@ int main() {
             boids_update(boids, &cfg, sim_dt);
         }
 
-        #pragma omp parallel for
-        for (int i = 0; i < cfg.num_boids; i++) {
-            boid *b = &boids[i];
-            
-            //la dirección en la que vuela el boid normalizada
-            vec3 dir_v = vec3_normalize(b->velocity);
-            Vector3 dir = { dir_v.x, dir_v.y, dir_v.z };
-            
-            //los conos de Raylib se generan mirando hacia arriba
-            Vector3 up_default = { 0.0f, 1.0f, 0.0f };
-            
-            //se calcula como rotar desde arriba hasta donde mira el boid
-            Quaternion q = QuaternionFromVector3ToVector3(up_default, dir);
-            Matrix rot = QuaternionToMatrix(q);
-            
-            //se calcula la matriz de su posicion en el mundo
-            Matrix trans = MatrixTranslate(b->position.x, b->position.y, b->position.z);
-            
-            //multiplicacion de las matrices, primero se rota y luego se translada
-            boidTransforms[i] = MatrixMultiply(rot, trans);
+        // solo se recalculan matrices si los boids se han movido o la vista ha cambiado
+        bool camera_moved = (movement.x != 0.0f) || (movement.y != 0.0f) || (movement.z != 0.0f)
+                         || (rotation.x != 0.0f) || (rotation.y != 0.0f) || (zoom != 0.0f) || IsWindowResized();
+
+        if (!is_paused || camera_moved || cfg.num_boids != prev_num_boids || transforms_dirty) {
+            // planos del frustum para descartar los boids que la camara no ve
+            Matrix view = GetCameraMatrix(camera);
+            float aspect = (float)GetScreenWidth() / (float)GetScreenHeight();
+            Matrix proj = MatrixPerspective(camera.fovy * DEG2RAD, aspect, CAMERA_NEAR_PLANE, CAMERA_FAR_PLANE);
+            frustum fr = frustum_from_view_projection(MatrixMultiply(view, proj));
+
+            visible_boids = 0;
+
+            #pragma omp parallel for
+            for (int i = 0; i < cfg.num_boids; i++) {
+                boid *b = &boids[i];
+
+                if (!frustum_contains_sphere(&fr, b->position, BOID_BOUNDING_RADIUS)) continue;
+
+                //la dirección en la que vuela el boid normalizada
+                vec3 dir = vec3_normalize(b->velocity);
+                Matrix transform = boid_transform(b->position, dir);
+
+                //reservar hueco en el array compactado de boids visibles
+                int slot;
+                #pragma omp atomic capture
+                slot = visible_boids++;
+
+                boidTransforms[slot] = transform;
+            }
+
+            prev_num_boids = cfg.num_boids;
+            transforms_dirty = false;
         }
 
         BeginDrawing();
@@ -787,8 +878,8 @@ int main() {
             GRAY
         );
 
-        //dibujado directo de todos los boids
-        DrawMeshInstanced(boidMesh, boidMaterial, boidTransforms, cfg.num_boids);
+        //dibujado directo de los boids visibles
+        if (visible_boids > 0) DrawMeshInstanced(boidMesh, boidMaterial, boidTransforms, visible_boids);
 
         EndMode3D();
 
@@ -870,6 +961,7 @@ int main() {
             sY += space;
             if (GuiButton((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH + 10 }, "Reset Simulation (R)")) {
                 boids_reset(boids, &cfg, seed, &sim_time);
+                transforms_dirty = true;
             }
 
             // nombre bajo el que se guardara la config actual como preset
