@@ -214,6 +214,16 @@ void boids_init(boid *boids, const config *cfg){
     }
 }
 
+// reinicia la simulación al estado cero re-sembrando el rng con la semilla dada
+void boids_reset(boid *boids, config *cfg, int seed, float *sim_time){
+    srand(seed);
+    for (int i = 0; i < 1024; i++) {
+        cfg->noise_table[i] = rand_range(-1.0f, 1.0f);
+    }
+    boids_init(boids, cfg);
+    *sim_time = 0.0f;
+}
+
 // actualización de las posiciones de los boids, recibe array de boids y configuración
 void boids_update(boid *boids, const config *cfg, float dt){
     for (int i = 0; i < cfg->num_boids; i++){
@@ -564,6 +574,11 @@ int main() {
 
         simulation_handle_input(&cfg, &is_paused);
 
+        // reinicio rápido de la simulación (deshabilitado mientras se edita la semilla)
+        if (IsKeyPressed(KEY_R) && !seed_edit_mode) {
+            boids_reset(boids, &cfg, seed, &sim_time);
+        }
+
         //UpdateCamera(&camera, CAMERA_FREE); //camara antes
         //velocidad de la camara
         float base_speed = 150.0f;
@@ -733,13 +748,8 @@ int main() {
 
             // reset de la simulacion con la semilla actual
             sY += space;
-            if (GuiButton((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH + 10 }, "Reset Simulation")) {
-                srand(seed);
-                for (int i = 0; i < 1024; i++) {
-                    cfg.noise_table[i] = rand_range(-1.0f, 1.0f);
-                }
-                boids_init(boids, &cfg);
-                sim_time = 0.0f;
+            if (GuiButton((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH + 10 }, "Reset Simulation (R)")) {
+                boids_reset(boids, &cfg, seed, &sim_time);
             }
         }
 
