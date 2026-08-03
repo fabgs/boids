@@ -19,6 +19,13 @@ typedef enum {
     BOUNDARY_WRAP
 } boundary_mode;
 
+// modo de la camara: libre o siguiendo a un boid concreto
+typedef enum {
+    CAM_MODE_FREE,
+    CAM_MODE_FIRST_PERSON,
+    CAM_MODE_THIRD_PERSON
+} camera_mode;
+
 // estructura que representa un boid, posición, velocidad y aceleración
 typedef struct {
     vec3 position;
@@ -734,6 +741,77 @@ Matrix boid_transform(vec3 pos, vec3 dir) {
     };
 }
 
+// dimensiones del panel de la ui (tambien usadas para ignorar los clics de seleccion sobre el)
+#define UI_PANEL_WIDTH 340
+#define UI_PANEL_HEIGHT 700
+
+// tolerancia angular del picking (~1 grado): un boid lejano ocupa un par de pixeles,
+// asi que se acepta todo lo que quede dentro de un pequeño cono alrededor del cursor
+#define PICK_TOLERANCE_RAD 0.02f
+
+// devuelve el boid mas centrado respecto al rayo del cursor dentro de la tolerancia, o -1 si no hay ninguno
+int boid_pick_from_ray(Ray ray, const boid *boids, int num_boids) {
+    int picked = -1;
+    float best_angular2 = 0.0f;
+
+    for (int i = 0; i < num_boids; i++) {
+        vec3 to_boid = vec3_sub(boids[i].position, (vec3){ ray.position.x, ray.position.y, ray.position.z });
+
+        // distancia a lo largo del rayo; negativa = detras de la camara
+        float t = to_boid.x * ray.direction.x + to_boid.y * ray.direction.y + to_boid.z * ray.direction.z;
+        if (t <= 0.0f) continue;
+
+        // distancia perpendicular al rayo (al cuadrado)
+        float perp2 = vec3_length2(to_boid) - t * t;
+
+        // radio aceptado: el cuerpo del boid mas un margen que crece con la distancia
+        float tolerance = BOID_BOUNDING_RADIUS + t * PICK_TOLERANCE_RAD;
+        if (perp2 > tolerance * tolerance) continue;
+
+        // gana el que este mas centrado en el cursor (menor angulo), no el mas cercano
+        float angular2 = perp2 / (t * t);
+        if (picked < 0 || angular2 < best_angular2) {
+            best_angular2 = angular2;
+            picked = i;
+        }
+    }
+
+    return picked;
+}
+
+// pasa al siguiente modo de camara (libre -> 1a persona -> 3a persona)
+// al salir del modo libre elige un boid aleatorio si no habia ninguno seleccionado
+void camera_mode_cycle(camera_mode *mode, int *followed_boid, int num_boids) {
+    *mode = (*mode + 1) % 3;
+
+    if (*mode != CAM_MODE_FREE && *followed_boid < 0) {
+        if (num_boids > 0) *followed_boid = rand() % num_boids;
+        else *mode = CAM_MODE_FREE;
+    }
+}
+
+// coloca la camara pegada al boid seguido: en el morro (1a persona) o detras y algo por encima (3a persona)
+void camera_follow_boid(Camera3D *camera, const boid *b, camera_mode mode, float distance) {
+    vec3 dir = vec3_normalize(b->velocity);
+    if (vec3_length2(dir) < 0.5f) dir = (vec3){0.0f, 0.0f, 1.0f}; // boid parado
+
+    vec3 pos, target;
+    if (mode == CAM_MODE_FIRST_PERSON) {
+        // justo delante de la punta del cono para no ver el propio cuerpo
+        pos = vec3_add(b->position, vec3_scale(dir, 0.7f));
+        target = vec3_add(b->position, vec3_scale(dir, 10.0f));
+    } else {
+        pos = vec3_add(b->position, vec3_scale(dir, -distance));
+        pos.y += distance * 0.35f;
+        target = b->position;
+    }
+
+    camera->position = (Vector3){ pos.x, pos.y, pos.z };
+    camera->target = (Vector3){ target.x, target.y, target.z };
+    // si el boid vuela casi en vertical la vista se alinearia con el up por defecto y la camara se voltearia
+    camera->up = (dir.x * dir.x + dir.z * dir.z < 0.001f) ? (Vector3){0.0f, 0.0f, 1.0f} : (Vector3){0.0f, 1.0f, 0.0f};
+}
+
 int main() {
     config cfg = {
         .num_boids = 50000,
@@ -786,6 +864,11 @@ int main() {
     bool show_ui = true;
     bool is_paused = false;
     bool seed_edit_mode = false;
+
+    // camara: modo actual, boid seguido y distancia de la vista en tercera persona
+    camera_mode cam_mode = CAM_MODE_FREE;
+    int followed_boid = -1;
+    float follow_distance = 8.0f;
 
     // carpeta de presets junto al ejecutable
     char presets_dir[512];
@@ -894,6 +977,20 @@ int main() {
             transforms_dirty = true;
         }
 
+        // alternar modo de camara
+        if (IsKeyPressed(KEY_C) && !typing) {
+            camera_mode_cycle(&cam_mode, &followed_boid, cfg.num_boids);
+            transforms_dirty = true;
+        }
+
+        // si el boid seguido deja de existir (slider de num boids o carga de snapshot), volver a camara libre
+        if (followed_boid >= cfg.num_boids) {
+            followed_boid = -1;
+            cam_mode = CAM_MODE_FREE;
+        }
+
+        bool following = (cam_mode != CAM_MODE_FREE && followed_boid >= 0);
+
         //UpdateCamera(&camera, CAMERA_FREE); //camara antes
         //velocidad de la camara
         float base_speed = 150.0f;
@@ -933,8 +1030,30 @@ int main() {
         // zoom con la rueda
         float zoom = GetMouseWheelMove() * 2.0f;
 
-        // se pasa el calculo a update camera
-        UpdateCameraPro(&camera, movement, rotation, zoom);
+        // seleccion de boid con clic (solo con la ui visible y fuera del panel)
+        if (show_ui && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+            Vector2 mouse = GetMousePosition();
+            Rectangle panel_rect = { (float)(GetScreenWidth() - UI_PANEL_WIDTH - 10), 10.0f, (float)UI_PANEL_WIDTH, (float)UI_PANEL_HEIGHT };
+
+            if (!CheckCollisionPointRec(mouse, panel_rect)) {
+                int picked = boid_pick_from_ray(GetScreenToWorldRay(mouse, camera), boids, cfg.num_boids);
+                if (picked >= 0) {
+                    followed_boid = picked;
+                    if (cam_mode == CAM_MODE_FREE) cam_mode = CAM_MODE_THIRD_PERSON;
+                    following = true;
+                    transforms_dirty = true;
+                }
+            }
+        }
+
+        if (!following) {
+            camera.up = (Vector3){0.0f, 1.0f, 0.0f};
+            // se pasa el calculo a update camera
+            UpdateCameraPro(&camera, movement, rotation, zoom);
+        } else {
+            // en modo seguimiento la rueda ajusta la distancia de la tercera persona
+            follow_distance = clamp_float(follow_distance - zoom, 2.0f, 60.0f);
+        }
 
         if (!is_paused) {
             //rellenar grid
@@ -946,6 +1065,9 @@ int main() {
             //actualizacion de boids
             boids_update(boids, &cfg, sim_dt);
         }
+
+        // la camara se pega al boid despues de moverlo para no ir un frame por detras
+        if (following) camera_follow_boid(&camera, &boids[followed_boid], cam_mode, follow_distance);
 
         // solo se recalculan matrices si los boids se han movido o la vista ha cambiado
         bool camera_moved = (movement.x != 0.0f) || (movement.y != 0.0f) || (movement.z != 0.0f)
@@ -963,6 +1085,9 @@ int main() {
             #pragma omp parallel for
             for (int i = 0; i < cfg.num_boids; i++) {
                 boid *b = &boids[i];
+
+                // en primera persona el boid seguido no se dibuja para no tapar la vista
+                if (cam_mode == CAM_MODE_FIRST_PERSON && i == followed_boid) continue;
 
                 if (!frustum_contains_sphere(&fr, b->position, BOID_BOUNDING_RADIUS)) continue;
 
@@ -1003,8 +1128,8 @@ int main() {
         EndMode3D();
 
         if (show_ui) {
-            int pW = 340;
-            int pH = 650;
+            int pW = UI_PANEL_WIDTH;
+            int pH = UI_PANEL_HEIGHT;
             
             // Ancho total de pantalla, menos el ancho del panel, menos 10 píxeles de margen
             int pX = GetScreenWidth() - pW - 10; 
@@ -1085,6 +1210,24 @@ int main() {
             sY += space;
             if (GuiButton((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH + 10 }, "Reset Simulation (R)")) {
                 boids_reset(boids, &cfg, seed, &sim_time);
+                transforms_dirty = true;
+            }
+
+            // alternar modo de camara (libre / 1a persona / 3a persona)
+            sY += space;
+            const char *cam_label = (cam_mode == CAM_MODE_FREE) ? "Camera: Free (C)"
+                                  : (cam_mode == CAM_MODE_FIRST_PERSON) ? TextFormat("Camera: 1st #%d (C)", followed_boid)
+                                  : TextFormat("Camera: 3rd #%d (C)", followed_boid);
+            if (GuiButton((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH + 10 }, cam_label)) {
+                camera_mode_cycle(&cam_mode, &followed_boid, cfg.num_boids);
+                transforms_dirty = true;
+            }
+
+            // elegir un boid aleatorio a seguir (tambien se puede clicar un boid en el mundo)
+            sY += space + 10;
+            if (GuiButton((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH + 10 }, "Follow Random Boid") && cfg.num_boids > 0) {
+                followed_boid = rand() % cfg.num_boids;
+                if (cam_mode == CAM_MODE_FREE) cam_mode = CAM_MODE_THIRD_PERSON;
                 transforms_dirty = true;
             }
 
