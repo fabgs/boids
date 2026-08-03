@@ -225,8 +225,63 @@ void boids_reset(boid *boids, config *cfg, int seed, float *sim_time){
     *sim_time = 0.0f;
 }
 
-#define PRESET_MAX_COUNT 64
-#define PRESET_MAX_NAME 64
+#define STATE_MAGIC "BSTA"
+#define STATE_VERSION 2
+
+// cabecera del archivo de snapshot guardado
+typedef struct {
+    char magic[4];
+    int version;
+    float sim_time;
+} state_header;
+
+// vuelca a un archivo binario la config completa (para retomar tambien los parametros) y la posicion/velocidad/aceleracion de cada boid activo
+bool boids_save_state(const boid *boids, const config *cfg, float sim_time, const char *filename) {
+    FILE *f = fopen(filename, "wb");
+    if (f == NULL) return false;
+
+    state_header header = { .version = STATE_VERSION, .sim_time = sim_time };
+    memcpy(header.magic, STATE_MAGIC, 4);
+
+    bool ok = fwrite(&header, sizeof(header), 1, f) == 1
+           && fwrite(cfg, sizeof(config), 1, f) == 1
+           && fwrite(boids, sizeof(boid), (size_t)cfg->num_boids, f) == (size_t)cfg->num_boids;
+
+    fclose(f);
+    return ok;
+}
+
+// restaura la config y el estado de los boids desde un archivo generado por boids_save_state
+bool boids_load_state(boid *boids, config *cfg, float *sim_time, const char *filename) {
+    FILE *f = fopen(filename, "rb");
+    if (f == NULL) return false;
+
+    state_header header;
+    config loaded_cfg;
+    if (fread(&header, sizeof(header), 1, f) != 1 || memcmp(header.magic, STATE_MAGIC, 4) != 0 || header.version != STATE_VERSION
+        || fread(&loaded_cfg, sizeof(config), 1, f) != 1
+        || loaded_cfg.num_boids < 0 || loaded_cfg.num_boids > cfg->max_boids) {
+        fclose(f);
+        return false;
+    }
+
+    bool ok = fread(boids, sizeof(boid), (size_t)loaded_cfg.num_boids, f) == (size_t)loaded_cfg.num_boids;
+    fclose(f);
+
+    if (!ok) return false;
+
+    // el limite de memoria reservada es del programa actual, no el guardado en el snapshot
+    int max_boids = cfg->max_boids;
+    *cfg = loaded_cfg;
+    cfg->max_boids = max_boids;
+    cfg->cos_blind_angle = cosf(PI - cfg->blind_angle);
+
+    *sim_time = header.sim_time;
+    return true;
+}
+
+#define FILE_LIST_MAX_COUNT 64
+#define FILE_LIST_MAX_NAME 64
 
 // convierte el modo de borde a texto para guardarlo en el archivo
 const char *boundary_mode_to_string(boundary_mode mode) {
@@ -299,29 +354,30 @@ bool config_load_preset(config *cfg, const char *filepath) {
     return true;
 }
 
-// escanea una carpeta en busca de archivos .cfg y construye la lista de nombres y el texto del desplegable
-int presets_refresh(const char *dir, char names[][PRESET_MAX_NAME], char *dropdown_text, int dropdown_text_size) {
+// escanea una carpeta en busca de archivos con la extension dada y construye la lista de nombres y el texto del desplegable
+// (usado tanto para los presets de configuracion como para los snapshots de simulacion)
+int refresh_file_list(const char *dir, const char *extension, char names[][FILE_LIST_MAX_NAME], char *dropdown_text, int dropdown_text_size, const char *empty_message) {
     dropdown_text[0] = '\0';
     int count = 0;
 
     if (!DirectoryExists(dir)) return 0;
 
-    FilePathList files = LoadDirectoryFilesEx(dir, ".cfg", false);
+    FilePathList files = LoadDirectoryFilesEx(dir, extension, false);
 
-    for (unsigned int i = 0; i < files.count && count < PRESET_MAX_COUNT; i++) {
+    for (unsigned int i = 0; i < files.count && count < FILE_LIST_MAX_COUNT; i++) {
         const char *name = GetFileNameWithoutExt(files.paths[i]);
 
         if (count > 0) strncat(dropdown_text, ";", dropdown_text_size - strlen(dropdown_text) - 1);
         strncat(dropdown_text, name, dropdown_text_size - strlen(dropdown_text) - 1);
 
-        strncpy(names[count], name, PRESET_MAX_NAME - 1);
-        names[count][PRESET_MAX_NAME - 1] = '\0';
+        strncpy(names[count], name, FILE_LIST_MAX_NAME - 1);
+        names[count][FILE_LIST_MAX_NAME - 1] = '\0';
         count++;
     }
 
     UnloadDirectoryFiles(files);
 
-    if (count == 0) strncpy(dropdown_text, "(sin presets)", dropdown_text_size - 1);
+    if (count == 0) strncpy(dropdown_text, empty_message, dropdown_text_size - 1);
 
     return count;
 }
@@ -692,13 +748,26 @@ int main() {
     snprintf(presets_dir, sizeof(presets_dir), "%spresets", GetApplicationDirectory());
     if (!DirectoryExists(presets_dir)) MakeDirectory(presets_dir);
 
-    char preset_names[PRESET_MAX_COUNT][PRESET_MAX_NAME];
+    char preset_names[FILE_LIST_MAX_COUNT][FILE_LIST_MAX_NAME];
     char preset_dropdown_text[1024];
-    int preset_count = presets_refresh(presets_dir, preset_names, preset_dropdown_text, sizeof(preset_dropdown_text));
+    int preset_count = refresh_file_list(presets_dir, ".cfg", preset_names, preset_dropdown_text, sizeof(preset_dropdown_text), "(sin presets)");
     int preset_selected = 0;
     bool preset_edit_mode = false;
-    char preset_name_input[PRESET_MAX_NAME] = "";
+    char preset_name_input[FILE_LIST_MAX_NAME] = "";
     bool preset_name_edit_mode = false;
+
+    // carpeta de snapshots (estado completo de la simulacion) junto al ejecutable
+    char snapshots_dir[512];
+    snprintf(snapshots_dir, sizeof(snapshots_dir), "%ssnapshots", GetApplicationDirectory());
+    if (!DirectoryExists(snapshots_dir)) MakeDirectory(snapshots_dir);
+
+    char snapshot_names[FILE_LIST_MAX_COUNT][FILE_LIST_MAX_NAME];
+    char snapshot_dropdown_text[1024];
+    int snapshot_count = refresh_file_list(snapshots_dir, ".snap", snapshot_names, snapshot_dropdown_text, sizeof(snapshot_dropdown_text), "(sin snapshots)");
+    int snapshot_selected = 0;
+    bool snapshot_edit_mode = false;
+    char snapshot_name_input[FILE_LIST_MAX_NAME] = "";
+    bool snapshot_name_edit_mode = false;
 
     // paso y reloj de la simulación fijos, para que no dependan del framerate real y sea reproducible
     const float sim_dt = 1.0f / 60.0f;
@@ -765,7 +834,7 @@ int main() {
         float dt = GetFrameTime();
 
         // mientras se edita un campo de texto, el teclado no debe disparar atajos ni mover la camara
-        bool typing = seed_edit_mode || preset_name_edit_mode;
+        bool typing = seed_edit_mode || preset_name_edit_mode || snapshot_name_edit_mode;
 
         if (!typing) simulation_handle_input(&cfg, &is_paused);
 
@@ -885,7 +954,7 @@ int main() {
 
         if (show_ui) {
             int pW = 340;
-            int pH = 610;
+            int pH = 650;
             
             // Ancho total de pantalla, menos el ancho del panel, menos 10 píxeles de margen
             int pX = GetScreenWidth() - pW - 10; 
@@ -899,6 +968,11 @@ int main() {
             int sW = 160;
             int sH = 15;
             int space = 28;
+
+            // ancho de fila para los controles con boton lateral (nombre/desplegable + Save/Load), alineado con el resto de la ui
+            int rowGap = 10;
+            int rowBtnW = 55;
+            int rowFieldW = sW + 10 - rowGap - rowBtnW;
 
             // Número de Boids
             float active_boids = (float)cfg.num_boids;
@@ -964,33 +1038,55 @@ int main() {
                 transforms_dirty = true;
             }
 
-            // nombre bajo el que se guardara la config actual como preset
+            // nombre bajo el que se guardara la config actual como preset, con su boton de guardado al lado
             sY += space + 10;
-            if (GuiTextBox((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH }, preset_name_input, PRESET_MAX_NAME, preset_name_edit_mode)) {
+            if (GuiTextBox((Rectangle){ (float)sX, (float)sY, (float)rowFieldW, (float)sH }, preset_name_input, FILE_LIST_MAX_NAME, preset_name_edit_mode)) {
                 preset_name_edit_mode = !preset_name_edit_mode;
             }
-
-            sY += space;
-            if (GuiButton((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH + 10 }, "Save Preset") && preset_name_input[0] != '\0') {
+            if (GuiButton((Rectangle){ (float)(sX + rowFieldW + rowGap), (float)sY, (float)rowBtnW, (float)sH }, "Save") && preset_name_input[0] != '\0') {
                 char filepath[600];
                 snprintf(filepath, sizeof(filepath), "%s/%s.cfg", presets_dir, preset_name_input);
                 config_save_preset(&cfg, filepath);
-                preset_count = presets_refresh(presets_dir, preset_names, preset_dropdown_text, sizeof(preset_dropdown_text));
+                preset_count = refresh_file_list(presets_dir, ".cfg", preset_names, preset_dropdown_text, sizeof(preset_dropdown_text), "(sin presets)");
                 if (preset_selected >= preset_count) preset_selected = (preset_count > 0) ? preset_count - 1 : 0;
             }
 
+            // desplegable de presets guardados, con su boton de carga al lado
             sY += space;
-            if (GuiButton((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH + 10 }, "Load Preset") && preset_count > 0) {
+            Rectangle presetDropdownRect = { (float)sX, (float)sY, (float)rowFieldW, (float)sH };
+            if (GuiButton((Rectangle){ (float)(sX + rowFieldW + rowGap), (float)sY, (float)rowBtnW, (float)sH }, "Load") && preset_count > 0) {
                 char filepath[600];
                 snprintf(filepath, sizeof(filepath), "%s/%s.cfg", presets_dir, preset_names[preset_selected]);
                 config_load_preset(&cfg, filepath);
             }
 
-            // el desplegable se guarda para dibujarlo el ultimo y que su lista aparezca por encima del resto de controles
+            // snapshots: guardan la config y la posicion/velocidad/aceleracion de todos los boids con nombre propio para retomar la simulacion despues
+            sY += space + 10;
+            if (GuiTextBox((Rectangle){ (float)sX, (float)sY, (float)rowFieldW, (float)sH }, snapshot_name_input, FILE_LIST_MAX_NAME, snapshot_name_edit_mode)) {
+                snapshot_name_edit_mode = !snapshot_name_edit_mode;
+            }
+            if (GuiButton((Rectangle){ (float)(sX + rowFieldW + rowGap), (float)sY, (float)rowBtnW, (float)sH }, "Save") && snapshot_name_input[0] != '\0') {
+                char filepath[600];
+                snprintf(filepath, sizeof(filepath), "%s/%s.snap", snapshots_dir, snapshot_name_input);
+                boids_save_state(boids, &cfg, sim_time, filepath);
+                snapshot_count = refresh_file_list(snapshots_dir, ".snap", snapshot_names, snapshot_dropdown_text, sizeof(snapshot_dropdown_text), "(sin snapshots)");
+                if (snapshot_selected >= snapshot_count) snapshot_selected = (snapshot_count > 0) ? snapshot_count - 1 : 0;
+            }
+
             sY += space;
-            Rectangle presetDropdownRect = { (float)sX, (float)sY, (float)sW, (float)sH };
+            Rectangle snapshotDropdownRect = { (float)sX, (float)sY, (float)rowFieldW, (float)sH };
+            if (GuiButton((Rectangle){ (float)(sX + rowFieldW + rowGap), (float)sY, (float)rowBtnW, (float)sH }, "Load") && snapshot_count > 0) {
+                char filepath[600];
+                snprintf(filepath, sizeof(filepath), "%s/%s.snap", snapshots_dir, snapshot_names[snapshot_selected]);
+                if (boids_load_state(boids, &cfg, &sim_time, filepath)) transforms_dirty = true;
+            }
+
+            // ambos desplegables se dibujan al final para que sus listas aparezcan por encima del resto de controles
             if (GuiDropdownBox(presetDropdownRect, preset_dropdown_text, &preset_selected, preset_edit_mode)) {
                 preset_edit_mode = !preset_edit_mode;
+            }
+            if (GuiDropdownBox(snapshotDropdownRect, snapshot_dropdown_text, &snapshot_selected, snapshot_edit_mode)) {
+                snapshot_edit_mode = !snapshot_edit_mode;
             }
         }
 
