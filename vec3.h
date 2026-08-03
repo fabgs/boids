@@ -30,6 +30,15 @@ static inline float vec3_dot(vec3 a, vec3 b) {
     return a.x * b.x + a.y * b.y + a.z * b.z;
 }
 
+// producto vectorial de dos vectores 3D
+static inline vec3 vec3_cross(vec3 a, vec3 b) {
+    return (vec3){
+        a.y * b.z - a.z * b.y,
+        a.z * b.x - a.x * b.z,
+        a.x * b.y - a.y * b.x
+    };
+}
+
 // longitud al cuadrado de un vector 3D
 static inline float vec3_length2(vec3 v) {
     return vec3_dot(v, v);
