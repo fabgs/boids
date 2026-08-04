@@ -1230,7 +1230,7 @@ int main() {
         BeginMode3D(camera);
 
         // dibujar el suelo y los limites del mundo
-        //DrawGrid(20, 1.0f); //TODO: se dibujara cuando se implemente el grid parametrizado para comprobaciones locales
+        //DrawGrid(20, 1.0f);
         if (cfg.show_world_bounds) {
             DrawCubeWires(
                 (Vector3){0.0f, 0.0f, 0.0f},
