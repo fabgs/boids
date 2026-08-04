@@ -28,11 +28,18 @@ typedef enum {
     CAM_MODE_THIRD_PERSON
 } camera_mode;
 
-// estructura que representa un boid, posición, velocidad y aceleración
+// faccion del boid dentro del ecosistema: las presas huyen y los depredadores cazan
+typedef enum {
+    FACTION_PREY,
+    FACTION_PREDATOR
+} boid_faction;
+
+// estructura que representa un boid, posición, velocidad, aceleración y facción
 typedef struct {
     vec3 position;
     vec3 velocity;
     vec3 acceleration;
+    boid_faction faction;
 } boid;
 
 // figura del obstaculo
@@ -147,6 +154,9 @@ typedef struct{
     float urgency_multiplier; // para que aceleren por distintos factores
     float agility; // facilidad para girar y frenar
     float avoid_weight; // peso de la fuerza de evasion de obstaculos y paredes
+    int num_predators; // numero de boids depredadores (los primeros indices del array)
+    float flee_weight; // peso de la evasion de las presas al ver un depredador
+    float hunt_weight; // peso de la caza de los depredadores hacia la presa mas cercana
     float noise_table[1024];
     boundary_mode boundary_mode;
     bool show_grid; // debug: dibujar las celdas ocupadas del grid espacial
@@ -287,7 +297,14 @@ void boid_apply_boundary(boid *b, const config *cfg){
     }
 }
 
-// inicializa la posición, velocidad y aceleración de los boids
+// reasigna la faccion de todos los boids: los primeros num_predators indices son depredadores
+void boids_assign_factions(boid *boids, const config *cfg) {
+    for (int i = 0; i < cfg->max_boids; i++) {
+        boids[i].faction = (i < cfg->num_predators) ? FACTION_PREDATOR : FACTION_PREY;
+    }
+}
+
+// inicializa la posición, velocidad, aceleración y facción de los boids
 void boids_init(boid *boids, const config *cfg){
     for (int i = 0; i < cfg->max_boids; i++){
         //creo un puntero a la posicion del boid
@@ -318,6 +335,8 @@ void boids_init(boid *boids, const config *cfg){
 
         b->acceleration = (vec3){0,0,0};
     }
+
+    boids_assign_factions(boids, cfg);
 }
 
 // reinicia la simulación al estado cero re-sembrando el rng con la semilla dada
@@ -354,12 +373,16 @@ void config_sanitize(config *cfg) {
     cfg->urgency_multiplier = clamp_float(cfg->urgency_multiplier, 0.01f, 1.0f);
     cfg->agility = clamp_float(cfg->agility, 0.1f, 10.0f);
     cfg->avoid_weight = clamp_float(cfg->avoid_weight, 0.0f, 3.0f);
+    if (cfg->num_predators < 0) cfg->num_predators = 0;
+    if (cfg->num_predators > cfg->max_boids) cfg->num_predators = cfg->max_boids;
+    cfg->flee_weight = clamp_float(cfg->flee_weight, 0.0f, 5.0f);
+    cfg->hunt_weight = clamp_float(cfg->hunt_weight, 0.0f, 5.0f);
     cfg->cos_blind_angle = cosf(PI - cfg->blind_angle);
 }
 
 #define STATE_MAGIC "BSTA"
-// v7: los obstaculos incluyen rotacion yaw/pitch (cambia sizeof(obstacle))
-#define STATE_VERSION 7
+// v8: los boids incluyen faccion y la config los parametros del ecosistema (cambia sizeof(boid) y sizeof(config))
+#define STATE_VERSION 8
 
 // cabecera del archivo de snapshot guardado
 typedef struct {
@@ -468,6 +491,9 @@ bool config_save_preset(const config *cfg, const char *filepath) {
     fprintf(f, "urgency_multiplier=%f\n", cfg->urgency_multiplier);
     fprintf(f, "agility=%f\n", cfg->agility);
     fprintf(f, "avoid_weight=%f\n", cfg->avoid_weight);
+    fprintf(f, "num_predators=%d\n", cfg->num_predators);
+    fprintf(f, "flee_weight=%f\n", cfg->flee_weight);
+    fprintf(f, "hunt_weight=%f\n", cfg->hunt_weight);
     fprintf(f, "boundary_mode=%s\n", boundary_mode_to_string(cfg->boundary_mode));
     fprintf(f, "show_grid=%d\n", cfg->show_grid ? 1 : 0);
     fprintf(f, "show_vision=%d\n", cfg->show_vision ? 1 : 0);
@@ -505,6 +531,9 @@ bool config_load_preset(config *cfg, const char *filepath) {
         else if (strcmp(key, "urgency_multiplier") == 0) cfg->urgency_multiplier = (float)atof(value);
         else if (strcmp(key, "agility") == 0) cfg->agility = (float)atof(value);
         else if (strcmp(key, "avoid_weight") == 0) cfg->avoid_weight = (float)atof(value);
+        else if (strcmp(key, "num_predators") == 0) cfg->num_predators = atoi(value);
+        else if (strcmp(key, "flee_weight") == 0) cfg->flee_weight = (float)atof(value);
+        else if (strcmp(key, "hunt_weight") == 0) cfg->hunt_weight = (float)atof(value);
         else if (strcmp(key, "boundary_mode") == 0) cfg->boundary_mode = boundary_mode_from_string(value);
         else if (strcmp(key, "show_grid") == 0) cfg->show_grid = (atoi(value) != 0);
         else if (strcmp(key, "show_vision") == 0) cfg->show_vision = (atoi(value) != 0);
@@ -742,6 +771,9 @@ void boids_compute_accelerations(boid *boids, const config *cfg, const spatial_g
         vec3 separation = {0, 0, 0};
         vec3 alignment = {0, 0, 0};
         vec3 cohesion = {0, 0, 0};
+        vec3 flee = {0, 0, 0}; // evasion acumulada de depredadores (solo presas)
+        vec3 hunt_target = {0, 0, 0}; // offset a la presa visible mas cercana (solo depredadores)
+        float closest_prey_dist = 1e30f;
 
         //calcular en qué celda está el boid observador
         int cx = (int)((observer->position.x + g->world_offset) / g->cell_size);
@@ -787,22 +819,32 @@ void boids_compute_accelerations(boid *boids, const config *cfg, const spatial_g
                             if (boids_are_neighbors(observer, other, cfg)) {
                                 vec3 offset_to_other = boids_offset(observer, other, cfg); 
                                 float distance = sqrtf(vec3_length2(offset_to_other));
-                                
-                                // separacion tiene en cuenta todo al rededor
-                                vec3 push_force = vec3_scale(offset_to_other, -1.0f / distance);
-                                separation = vec3_add(separation, push_force);
-                                total_neighbors++;
 
-                                // angulo ciego para cohesion y alineación
+                                // angulo ciego respecto a la direccion de vuelo
                                 float dir_x = offset_to_other.x / distance;
                                 float dir_y = offset_to_other.y / distance;
                                 float dir_z = offset_to_other.z / distance;
                                 float dot_prod = (fwd_dir.x * dir_x) + (fwd_dir.y * dir_y) + (fwd_dir.z * dir_z);
-                                
-                                if (dot_prod >= cfg->cos_blind_angle) {
-                                    alignment = vec3_add(alignment, other->velocity);
-                                    cohesion = vec3_add(cohesion, offset_to_other);
-                                    visual_neighbors++;
+
+                                if (other->faction == observer->faction) {
+                                    // separacion tiene en cuenta todo al rededor
+                                    vec3 push_force = vec3_scale(offset_to_other, -1.0f / distance);
+                                    separation = vec3_add(separation, push_force);
+                                    total_neighbors++;
+
+                                    // angulo ciego para cohesion y alineación
+                                    if (dot_prod >= cfg->cos_blind_angle) {
+                                        alignment = vec3_add(alignment, other->velocity);
+                                        cohesion = vec3_add(cohesion, offset_to_other);
+                                        visual_neighbors++;
+                                    }
+                                } else if (observer->faction == FACTION_PREY) {
+                                    // evasion: repulsion omnidireccional que crece cuanto mas cerca esta el depredador
+                                    flee = vec3_add(flee, vec3_scale(offset_to_other, -1.0f / (distance * distance)));
+                                } else if (dot_prod >= cfg->cos_blind_angle && distance < closest_prey_dist) {
+                                    // caza: fijar como objetivo la presa visible mas cercana
+                                    closest_prey_dist = distance;
+                                    hunt_target = offset_to_other;
                                 }
                             }
                         }
@@ -851,6 +893,12 @@ void boids_compute_accelerations(boid *boids, const config *cfg, const spatial_g
         if (total_neighbors > 0) desired_dir = vec3_add(desired_dir, vec3_scale(separation, cfg->separation_weight));
         if (visual_neighbors > 0) desired_dir = vec3_add(desired_dir, vec3_scale(alignment, cfg->alignment_weight));
         if (visual_neighbors > 0) desired_dir = vec3_add(desired_dir, vec3_scale(cohesion, cfg->cohesion_weight));
+
+        // reglas entre facciones enemigas: evasion (presas) y caza (depredadores)
+        desired_dir = vec3_add(desired_dir, vec3_scale(flee, cfg->flee_weight));
+        if (closest_prey_dist < 1e30f) {
+            desired_dir = vec3_add(desired_dir, vec3_scale(vec3_normalize(hunt_target), cfg->hunt_weight));
+        }
 
         // evasion de obstaculos y paredes con su propio peso
         vec3 avoidance = boid_compute_avoidance(observer, fwd_dir, current_speed, cfg, obstacles, num_obstacles);
@@ -911,6 +959,8 @@ spatial_grid spatial_grid_init(const config *cfg){
 }
 
 // actualizador de posiciones de boids en el grid
+// el grid indexa todos los boids sin importar su faccion: el filtrado presa/depredador
+// se hace al visitar cada vecino en boids_compute_accelerations
 void grid_build(spatial_grid *g, const boid *boids, const config *cfg) {
     // Recalcular parametros por si el usuario ha movido el slider
     grid_compute_dims(g, cfg);
@@ -961,6 +1011,8 @@ void grid_build(spatial_grid *g, const boid *boids, const config *cfg) {
 #define BOID_BOUNDING_RADIUS 0.7f
 // color base de los boids (SKYBLUE) cuando el heatmap esta desactivado
 #define BOID_BASE_COLOR (vec3){0.4f, 0.75f, 1.0f}
+// color de los depredadores cuando el heatmap esta desactivado
+#define PREDATOR_BASE_COLOR (vec3){1.0f, 0.35f, 0.25f}
 // color de los obstaculos colocados
 #define OBSTACLE_COLOR (Color){ 225, 95, 70, 255 }
 
@@ -1109,7 +1161,7 @@ void debug_draw_vision(const boid *b, const config *cfg) {
 
 // dimensiones del panel de la ui (tambien usadas para ignorar los clics de seleccion sobre el)
 #define UI_PANEL_WIDTH 340
-#define UI_PANEL_HEIGHT 1061
+#define UI_PANEL_HEIGHT 1139
 
 // tolerancia angular del picking (~1 grado): un boid lejano ocupa un par de pixeles,
 // asi que se acepta todo lo que quede dentro de un pequeño cono alrededor del cursor
@@ -1219,6 +1271,9 @@ int main() {
         .urgency_multiplier = 0.5f,
         .agility = 5.0f,
         .avoid_weight = 1.5f,
+        .num_predators = 200,
+        .flee_weight = 2.0f,
+        .hunt_weight = 1.0f,
         .boundary_mode = BOUNDARY_WRAP,
         .show_grid = false,
         .show_vision = false,
@@ -1573,7 +1628,7 @@ int main() {
                 Matrix transform = boid_transform(b->position, dir);
 
                 // color por instancia inyectado en la fila libre de la matriz (m3, m7, m11)
-                vec3 color = BOID_BASE_COLOR;
+                vec3 color = (b->faction == FACTION_PREDATOR) ? PREDATOR_BASE_COLOR : BOID_BASE_COLOR;
                 if (cfg.show_speed_heatmap) {
                     float t = (speed - cfg.min_speed) / fmaxf(cfg.max_speed - cfg.min_speed, 0.001f);
                     color = speed_heatmap_color(clamp_float(t, 0.0f, 1.0f));
@@ -1722,6 +1777,22 @@ int main() {
             sY += space;
             GuiSliderBar((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH }, "Avoidance", TextFormat("%.2f", cfg.avoid_weight), &cfg.avoid_weight, 0.0f, 3.0f);
 
+            // ecosistema: cantidad de depredadores y pesos de evasion/caza
+            sY += space;
+            float active_predators = (float)cfg.num_predators;
+            GuiSliderBar((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH }, "Predators", TextFormat("%d", cfg.num_predators), &active_predators, 0.0f, (float)cfg.num_boids);
+            if ((int)active_predators != cfg.num_predators) {
+                cfg.num_predators = (int)active_predators;
+                boids_assign_factions(boids, &cfg);
+                transforms_dirty = true;
+            }
+
+            sY += space;
+            GuiSliderBar((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH }, "Flee (prey)", TextFormat("%.2f", cfg.flee_weight), &cfg.flee_weight, 0.0f, 5.0f);
+
+            sY += space;
+            GuiSliderBar((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH }, "Hunt (pred)", TextFormat("%.2f", cfg.hunt_weight), &cfg.hunt_weight, 0.0f, 5.0f);
+
             // Comportamiento de bordes: BOUNCE -> WRAP -> STEER (evasion suave)
             sY += space;
             if (GuiButton((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH }, TextFormat("Boundary: %s (B)", boundary_mode_to_string(cfg.boundary_mode)))) {
@@ -1785,6 +1856,9 @@ int main() {
                 char filepath[600];
                 snprintf(filepath, sizeof(filepath), "%s/%s.cfg", presets_dir, preset_names[preset_selected]);
                 config_load_preset(&cfg, filepath);
+                // el preset puede cambiar el numero de depredadores
+                boids_assign_factions(boids, &cfg);
+                transforms_dirty = true;
             }
 
             // snapshots: guardan la config y la posicion/velocidad/aceleracion de todos los boids con nombre propio para retomar la simulacion despues
