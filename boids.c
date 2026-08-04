@@ -1450,6 +1450,9 @@ int main() {
             else DisableCursor();
         }
 
+        // pantalla completa (ventana sin bordes a resolucion del monitor)
+        if (IsKeyPressed(KEY_F11)) ToggleBorderlessWindowed();
+
         // rotación con el ratón (solo si la ui esta oculta)
         Vector3 rotation = {0};
         if (!show_ui) {
@@ -1521,8 +1524,8 @@ int main() {
 
         if (!following) {
             camera.up = (Vector3){0.0f, 1.0f, 0.0f};
-            // se pasa el calculo a update camera
-            UpdateCameraPro(&camera, movement, rotation, zoom);
+            // zoom negado: para UpdateCameraPro positivo aleja, pero rueda hacia delante debe acercar
+            UpdateCameraPro(&camera, movement, rotation, -zoom);
         } else {
             // en modo seguimiento la rueda ajusta la distancia de la tercera persona
             follow_distance = clamp_float(follow_distance - zoom, 2.0f, 60.0f);
