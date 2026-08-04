@@ -54,6 +54,15 @@ static inline vec3 vec3_normalize(vec3 v) {
     return (vec3){0, 0, 0};
 }
 
+// interpolacion lineal entre dos vectores 3D
+static inline vec3 vec3_lerp(vec3 a, vec3 b, float t) {
+    return (vec3){
+        a.x + (b.x - a.x) * t,
+        a.y + (b.y - a.y) * t,
+        a.z + (b.z - a.z) * t
+    };
+}
+
 static inline vec3 vec3_clamp_length(vec3 v, float min, float max) {
     float len2 = vec3_length2(v);
 

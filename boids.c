@@ -68,8 +68,11 @@ typedef struct{
     bool show_world_bounds; // debug: dibujar el cubo de limites del mundo
     bool show_fps; // debug: mostrar contador de fps
     bool show_crosshair; // debug: mostrar mirilla central al volar con la ui oculta
+    bool show_speed_heatmap; // debug: colorear boids segun su velocidad actual
 } config;
 
+// el color por instancia viaja de contrabando en la fila inferior de la matriz (m3, m7, m11),
+// que en una transformacion afin siempre es (0, 0, 0, 1); hay que limpiarla antes de proyectar
 const char *instancingVS =
     "#version 330\n"
     "in vec3 vertexPosition;\n"
@@ -77,19 +80,25 @@ const char *instancingVS =
     "in mat4 instanceTransform;\n"
     "uniform mat4 mvp;\n"
     "out vec3 fragNormal;\n"
+    "out vec3 instanceColor;\n"
     "void main()\n"
     "{\n"
-    "    fragNormal = normalize(mat3(instanceTransform) * vertexNormal);\n"
-    "    gl_Position = mvp * instanceTransform * vec4(vertexPosition, 1.0);\n"
+    "    instanceColor = vec3(instanceTransform[0].w, instanceTransform[1].w, instanceTransform[2].w);\n"
+    "    mat4 transform = instanceTransform;\n"
+    "    transform[0].w = 0.0;\n"
+    "    transform[1].w = 0.0;\n"
+    "    transform[2].w = 0.0;\n"
+    "    fragNormal = normalize(mat3(transform) * vertexNormal);\n"
+    "    gl_Position = mvp * transform * vec4(vertexPosition, 1.0);\n"
     "}\n";
 
 const char *instancingFS =
     "#version 330\n"
-    "uniform vec4 colDiffuse;\n"
+    "in vec3 instanceColor;\n"
     "out vec4 finalColor;\n"
     "void main()\n"
     "{\n"
-    "    finalColor = colDiffuse;\n"
+    "    finalColor = vec4(instanceColor, 1.0);\n"
     "}\n";
 // genera un float aleatorio entre dos valores
 float rand_range(float a, float b){
@@ -357,6 +366,7 @@ bool config_save_preset(const config *cfg, const char *filepath) {
     fprintf(f, "show_world_bounds=%d\n", cfg->show_world_bounds ? 1 : 0);
     fprintf(f, "show_fps=%d\n", cfg->show_fps ? 1 : 0);
     fprintf(f, "show_crosshair=%d\n", cfg->show_crosshair ? 1 : 0);
+    fprintf(f, "show_speed_heatmap=%d\n", cfg->show_speed_heatmap ? 1 : 0);
 
     fclose(f);
     return true;
@@ -392,6 +402,7 @@ bool config_load_preset(config *cfg, const char *filepath) {
         else if (strcmp(key, "show_world_bounds") == 0) cfg->show_world_bounds = (atoi(value) != 0);
         else if (strcmp(key, "show_fps") == 0) cfg->show_fps = (atoi(value) != 0);
         else if (strcmp(key, "show_crosshair") == 0) cfg->show_crosshair = (atoi(value) != 0);
+        else if (strcmp(key, "show_speed_heatmap") == 0) cfg->show_speed_heatmap = (atoi(value) != 0);
     }
 
     fclose(f);
@@ -690,6 +701,8 @@ void grid_build(spatial_grid *g, const boid *boids, const config *cfg) {
 #define CAMERA_FAR_PLANE 1000.0f
 // esfera que envuelve el cono del boid para el culling
 #define BOID_BOUNDING_RADIUS 0.7f
+// color base de los boids (SKYBLUE) cuando el heatmap esta desactivado
+#define BOID_BASE_COLOR (vec3){0.4f, 0.75f, 1.0f}
 
 // los 6 planos (a,b,c,d) del volumen visible de la camara
 typedef struct {
@@ -755,6 +768,15 @@ Matrix boid_transform(vec3 pos, vec3 dir) {
         -kxz,                       dir.z,  dir.y + k * dir.x * dir.x,  pos.z,
         0.0f,                       0.0f,   0.0f,                       1.0f
     };
+}
+
+// paleta del heatmap: azul oscuro (lento) -> azul (media) -> celeste brillante (rapido)
+vec3 speed_heatmap_color(float t) {
+    const vec3 slow = {0.05f, 0.08f, 0.35f};
+    const vec3 mid  = {0.15f, 0.35f, 0.95f};
+    const vec3 fast = {0.85f, 0.97f, 1.00f};
+    if (t < 0.5f) return vec3_lerp(slow, mid, t * 2.0f);
+    return vec3_lerp(mid, fast, (t - 0.5f) * 2.0f);
 }
 
 // dibuja en modo debug solo las celdas del grid que contienen algun boid
@@ -905,6 +927,7 @@ int main() {
         .show_world_bounds = true,
         .show_fps = true,
         .show_crosshair = true,
+        .show_speed_heatmap = false,
     };
 
     //calculo del coseno del angulo muerto
@@ -1174,9 +1197,20 @@ int main() {
 
                 if (!frustum_contains_sphere(&fr, b->position, BOID_BOUNDING_RADIUS)) continue;
 
-                //la dirección en la que vuela el boid normalizada
-                vec3 dir = vec3_normalize(b->velocity);
+                //la dirección en la que vuela el boid normalizada (la longitud se reutiliza para el heatmap)
+                float speed = sqrtf(vec3_length2(b->velocity));
+                vec3 dir = (speed > 0.0f) ? vec3_scale(b->velocity, 1.0f / speed) : (vec3){0.0f, 0.0f, 0.0f};
                 Matrix transform = boid_transform(b->position, dir);
+
+                // color por instancia inyectado en la fila libre de la matriz (m3, m7, m11)
+                vec3 color = BOID_BASE_COLOR;
+                if (cfg.show_speed_heatmap) {
+                    float t = (speed - cfg.min_speed) / fmaxf(cfg.max_speed - cfg.min_speed, 0.001f);
+                    color = speed_heatmap_color(clamp_float(t, 0.0f, 1.0f));
+                }
+                transform.m3 = color.x;
+                transform.m7 = color.y;
+                transform.m11 = color.z;
 
                 //reservar hueco en el array compactado de boids visibles
                 int slot;
@@ -1390,6 +1424,11 @@ int main() {
             GuiCheckBox((Rectangle){ (float)sX, (float)sY, 15, 15 }, "Show FPS", &cfg.show_fps);
             sY += space;
             GuiCheckBox((Rectangle){ (float)sX, (float)sY, 15, 15 }, "Show Crosshair", &cfg.show_crosshair);
+            sY += space;
+            bool prev_heatmap = cfg.show_speed_heatmap;
+            GuiCheckBox((Rectangle){ (float)sX, (float)sY, 15, 15 }, "Speed Heatmap", &cfg.show_speed_heatmap);
+            // en pausa las matrices no se recalculan, hay que forzar el refresco del color
+            if (cfg.show_speed_heatmap != prev_heatmap) transforms_dirty = true;
 
             // ambos desplegables se dibujan al final para que sus listas aparezcan por encima del resto de controles
             if (GuiDropdownBox(presetDropdownRect, preset_dropdown_text, &preset_selected, preset_edit_mode)) {
