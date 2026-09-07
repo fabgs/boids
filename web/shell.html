@@ -21,6 +21,16 @@
         #status .error { color: #e15f46; max-width: 62ch; }
         #status .hint { color: #5c6b7a; font-size: 13px; max-width: 62ch; }
         #status progress { width: 260px; accent-color: #5bb2d9; }
+        /* enlace de vuelta al portfolio; el hud de la simulacion deja este hueco libre (HUD_TOP_OFFSET en boids.c) */
+        #back {
+            position: fixed; top: 8px; left: 10px; z-index: 5;
+            padding: 4px 10px; border-radius: 999px;
+            background: rgba(32, 36, 43, 0.85); border: 1px solid #2a2f3a;
+            color: #8fa4b5; font: 13px system-ui, -apple-system, "Segoe UI", sans-serif; text-decoration: none;
+        }
+        #back:hover { color: #c9effe; border-color: #5bb2d9; }
+        /* en movil el panel ocupa casi toda la anchura y taparia el enlace arriba: se baja a la esquina inferior izquierda */
+        @media (pointer: coarse) { #back { top: auto; bottom: 10px; } }
     </style>
     <!-- GitHub Pages no permite cabeceras personalizadas: este service worker anade COOP/COEP en el cliente para
          que el navegador habilite SharedArrayBuffer (necesario para los hilos). En servidores que ya envian las
@@ -32,8 +42,10 @@
         <h1>Boids 3D</h1>
         <div id="status-text">Cargando…</div>
         <progress id="status-progress" value="0" max="100" hidden></progress>
-        <div class="hint">TAB oculta la UI y libera el raton para volar · WASD + raton · P pausa · R reinicia · F11 pantalla completa</div>
+        <div class="hint" id="status-hint">TAB oculta la UI y libera el raton para volar · WASD + raton · P pausa · R reinicia · F11 pantalla completa</div>
     </div>
+
+    <a id="back" href="/" title="Volver al portfolio">&larr; fabgs.dev</a>
 
     <canvas class="emscripten" id="canvas" oncontextmenu="event.preventDefault()" tabindex="-1"></canvas>
 
@@ -41,6 +53,12 @@
         var statusBox = document.getElementById('status');
         var statusText = document.getElementById('status-text');
         var statusProgress = document.getElementById('status-progress');
+
+        // en movil o tablet los controles son gestos (mismo criterio que touch_mode en boids.c)
+        if ((navigator.maxTouchPoints > 0 && window.matchMedia('(pointer: coarse)').matches) || location.search.indexOf('touch') >= 0) {
+            document.getElementById('status-hint').textContent =
+                'Arrastra con un dedo para girar la camara · pinza para acercar · dos dedos para desplazarte · toca un boid para seguirlo · la X del panel lo oculta';
+        }
 
         function showError(message) {
             statusBox.classList.remove('hidden');
