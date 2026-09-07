@@ -53,6 +53,18 @@ Some emergent scenarios captured during simulation:
 | Left / right click | Place / remove obstacle |
 | Arrow keys + wheel | Rotate and scale the obstacle before placing it |
 | `F11` | Borderless fullscreen |
+| Panel `X` button | Hide the UI (same as `Tab`) |
+
+On touch devices (web version on a phone or tablet) the controls are gestures instead:
+
+| Gesture | Effect |
+|---|---|
+| One-finger drag | Rotate the camera |
+| Pinch | Move forward / backward (distance of the ghost in placement mode) |
+| Two-finger drag | Move sideways / up and down |
+| Tap | Select a boid to follow, or place an obstacle in placement mode |
+| Long press | Remove the obstacle under the finger (placement mode) |
+| Panel `X` / `Show UI` button | Hide / show the UI |
 
 ## Building (Windows)
 
@@ -72,7 +84,7 @@ gcc boids.c -o boids.exe -O3 -Wall -fopenmp -I.\include -L.\lib -lraylibdll
 
 ## Web version (WebAssembly)
 
-The same `boids.c` compiles to WebAssembly with [Emscripten](https://emscripten.org/) and runs in the browser on WebGL 2, no rewrite and no `ASYNCIFY`. Live build: **https://fgs36-ua.github.io/boids/** (published from `master` by the `Deploy web` GitHub Actions workflow; Pages must be set to *Source: GitHub Actions* in the repo settings).
+The same `boids.c` compiles to WebAssembly with [Emscripten](https://emscripten.org/) and runs in the browser on WebGL 2, no rewrite and no `ASYNCIFY`. Live build: **https://fabgs.dev/boids/** (published from `master` by the `Deploy web` GitHub Actions workflow; Pages must be set to *Source: GitHub Actions* in the repo settings).
 
 What changes on the web, all behind `#if defined(PLATFORM_WEB)`:
 
@@ -85,6 +97,8 @@ What changes on the web, all behind `#if defined(PLATFORM_WEB)`:
 | `rlEnableWireMode` (`glPolygonMode`) for obstacle wireframes | Edges emitted as `RL_LINES` (no `glPolygonMode` in WebGL) |
 | Presets / snapshots / maps on disk next to the .exe | Virtual filesystem: bundled examples are preloaded, user saves go to `/persist`, mounted on **IndexedDB** so they survive reloads |
 | Fixed 1920x1080 window | Canvas fills the viewport and follows browser resizes; the UI panel compresses its rows if the viewport is shorter than the panel |
+| Keyboard + mouse | On touch devices (coarse pointer) a touch mode kicks in: gesture camera, tap / long press instead of clicks, a floating button instead of `Tab`, and a lower default boid count. Add `?touch` to the URL to force it on desktop |
+| `fabgs.github.io/boids/` | The HTML shell adds a small link back to the portfolio (`/`) |
 
 ### Building the web version
 

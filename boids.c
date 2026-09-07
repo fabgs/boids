@@ -785,6 +785,7 @@ typedef struct {
     pthread_cond_t done_cond;
     unsigned generation;
     int pending;
+    int ready; // workers que ya han arrancado (atomico)
     range_fn fn;
     void *ctx;
     int n;
@@ -795,6 +796,7 @@ static thread_pool pool;
 static void *pool_worker(void *arg) {
     int index = (int)(intptr_t)arg;
     unsigned seen = 0;
+    __atomic_fetch_add(&pool.ready, 1, __ATOMIC_SEQ_CST);
     for (;;) {
         pthread_mutex_lock(&pool.mutex);
         while (pool.generation == seen) pthread_cond_wait(&pool.start_cond, &pool.mutex);
@@ -812,7 +814,8 @@ static void *pool_worker(void *arg) {
 
 static void parallel_init(void) {
     int cores = emscripten_num_logical_cores();
-    if (cores < 1) cores = 1;
+    // safari en ios no expone navigator.hardwareConcurrency: se asume un movil de 4 nucleos
+    if (cores < 1) cores = 4;
     if (cores > POOL_MAX_THREADS) cores = POOL_MAX_THREADS;
 
     pthread_mutex_init(&pool.mutex, NULL);
@@ -820,7 +823,9 @@ static void parallel_init(void) {
     pthread_cond_init(&pool.done_cond, NULL);
     pool.num_threads = 1;
 
-    // los workers salen del pool que emscripten precrea al arrancar (-sPTHREAD_POOL_SIZE); si alguno falla se sigue con menos
+    // los workers salen del pool que emscripten precrea al arrancar (-sPTHREAD_POOL_SIZE). si el pool no alcanza, emscripten
+    // los crea de forma asincrona y arrancan cuando el hilo principal vuelve al bucle de eventos (cada frame): hasta que
+    // todos estan listos parallel_for trabaja en el hilo principal para no bloquearse esperando a un hilo que aun no existe
     for (int t = 1; t < cores; t++) {
         if (pthread_create(&pool.threads[t], NULL, pool_worker, (void *)(intptr_t)t) != 0) break;
         pool.num_threads++;
@@ -829,7 +834,8 @@ static void parallel_init(void) {
 }
 
 static void parallel_for(int n, range_fn fn, void *ctx) {
-    if (pool.num_threads <= 1 || n < pool.num_threads * POOL_MIN_ITEMS_PER_THREAD) {
+    if (pool.num_threads <= 1 || n < pool.num_threads * POOL_MIN_ITEMS_PER_THREAD
+        || __atomic_load_n(&pool.ready, __ATOMIC_SEQ_CST) < pool.num_threads - 1) {
         fn(0, n, ctx);
         return;
     }
@@ -1271,7 +1277,14 @@ void debug_draw_vision(const boid *b, const config *cfg) {
 #define UI_PANEL_HEIGHT 1061
 // separacion vertical entre filas de controles y cuantas filas la usan (para poder comprimir el panel)
 #define UI_ROW_SPACE 26
-#define UI_ROW_SPACE_MIN 21
+#define UI_ROW_SPACE_MIN 18
+
+// en web el shell html coloca un enlace de vuelta al portfolio en la esquina superior izquierda: el hud baja para no taparlo
+#if defined(PLATFORM_WEB)
+    #define HUD_TOP_OFFSET 30
+#else
+    #define HUD_TOP_OFFSET 0
+#endif
 #define UI_ROW_COUNT 38
 
 // si la ventana es mas baja que el panel (p. ej. el viewport de un navegador a 1080p) se juntan las filas para que quepa
@@ -1493,6 +1506,16 @@ static boid *boids = NULL;
 static spatial_grid grid;
 
 static bool show_ui = true;
+
+// dispositivo tactil (movil o tablet): sin teclado ni puntero fino, la camara se maneja con gestos y el panel con toques
+static bool touch_mode = false;
+// gesto en curso: dedos y posiciones del frame anterior, y datos del toque actual para distinguir toque corto, largo y arrastre
+static int prev_touch_count = 0;
+static Vector2 prev_touch[2];
+static Vector2 touch_start_pos;
+static double touch_start_time = 0.0;
+static bool touch_moved = false;
+static bool touch_on_panel = false;
 static bool is_paused = false;
 static bool seed_edit_mode = false;
 
@@ -1560,6 +1583,19 @@ static Material boidMaterial;
 static Shader shader;
 static Matrix *boidTransforms = NULL;
 static Camera3D camera = {0};
+
+// muestra u oculta el panel; con raton, al ocultarlo se captura el cursor para volar (en tactil no hay cursor que capturar)
+static void ui_set_visible(bool visible) {
+    show_ui = visible;
+    if (touch_mode) return;
+    if (visible) EnableCursor();
+    else DisableCursor();
+}
+
+// boton flotante para volver a mostrar el panel en tactil (no hay TAB)
+static Rectangle touch_show_ui_button_rect(void) {
+    return (Rectangle){ 10.0f, (float)(HUD_TOP_OFFSET + 40), 90.0f, 26.0f };
+}
 
 // dibuja la malla unitaria de un tipo de obstaculo en alambre con la transformacion dada
 static void draw_obstacle_wires(int type, Matrix transform, Color color) {
@@ -1646,18 +1682,14 @@ static void update_draw_frame(void) {
     }
 
     // desactivar ui
-    if (IsKeyPressed(KEY_TAB) && !typing) {
-        show_ui = !show_ui;
-        if (show_ui) EnableCursor();
-        else DisableCursor();
-    }
+    if (IsKeyPressed(KEY_TAB) && !typing) ui_set_visible(!show_ui);
 
     // pantalla completa (ventana sin bordes a resolucion del monitor)
     if (IsKeyPressed(KEY_F11)) ToggleBorderlessWindowed();
 
-    // rotación con el ratón (solo si la ui esta oculta)
+    // rotación con el ratón (solo si la ui esta oculta; en tactil la rotacion sale de los gestos de mas abajo)
     Vector3 rotation = {0};
-    if (!show_ui) {
+    if (!show_ui && !touch_mode) {
         Vector2 mouseDelta = GetMouseDelta();
         rotation.x = mouseDelta.x * 0.1f;
         rotation.y = mouseDelta.y * 0.1f;
@@ -1666,15 +1698,69 @@ static void update_draw_frame(void) {
     // zoom con la rueda
     float zoom = GetMouseWheelMove() * 2.0f;
 
+    // clic principal (seleccionar boid / colocar obstaculo) y secundario (borrar obstaculo): con raton son los botones,
+    // en tactil un toque corto y un toque largo. el navegador ya traduce el primer dedo a raton para la ui (raygui)
+    bool primary_click = !touch_mode && IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
+    bool secondary_click = !touch_mode && IsMouseButtonPressed(MOUSE_BUTTON_RIGHT);
+
     // punto de apuntado compartido por seleccion de boids y colocacion de obstaculos:
-    // con la ui visible es el cursor (fuera del panel), con la ui oculta el centro de la pantalla
+    // con la ui visible es el cursor (fuera del panel), con la ui oculta el centro de la pantalla; en tactil, donde se toca
     Vector2 aim = { GetScreenWidth() * 0.5f, GetScreenHeight() * 0.5f };
     bool aim_valid = true;
+    Rectangle panel_rect = { (float)(GetScreenWidth() - UI_PANEL_WIDTH - 10), 10.0f, (float)UI_PANEL_WIDTH, (float)ui_panel_height() };
 
     if (show_ui) {
         aim = GetMousePosition();
-        Rectangle panel_rect = { (float)(GetScreenWidth() - UI_PANEL_WIDTH - 10), 10.0f, (float)UI_PANEL_WIDTH, (float)ui_panel_height() };
         aim_valid = !CheckCollisionPointRec(aim, panel_rect);
+    }
+
+    if (touch_mode) {
+        // gestos: un dedo arrastra = girar la camara; dos dedos = pinza para acercar/alejar y arrastre para desplazarse.
+        // los deltas se miden entre frames con el mismo numero de dedos para no dar saltos al poner o quitar un dedo
+        int touch_count = GetTouchPointCount();
+        if (touch_count > 2) touch_count = 2;
+        Vector2 touch[2] = { GetTouchPosition(0), GetTouchPosition(1) };
+
+        if (touch_count > 0 && prev_touch_count == 0) {
+            // empieza un toque: se guarda para distinguir al soltar entre toque corto, toque largo y arrastre
+            touch_start_pos = touch[0];
+            touch_start_time = GetTime();
+            touch_moved = false;
+            // lo que empieza sobre el panel o el boton flotante es de la ui, no un gesto ni un clic en la escena
+            touch_on_panel = (show_ui && CheckCollisionPointRec(touch[0], panel_rect))
+                          || (!show_ui && CheckCollisionPointRec(touch[0], touch_show_ui_button_rect()));
+        }
+        if (touch_count > 0 && !touch_moved && Vector2Distance(touch[0], touch_start_pos) > 12.0f) touch_moved = true;
+
+        if (touch_count == prev_touch_count && !touch_on_panel) {
+            if (touch_count == 1 && touch_moved) {
+                rotation.x = (touch[0].x - prev_touch[0].x) * 0.2f;
+                rotation.y = (touch[0].y - prev_touch[0].y) * 0.2f;
+            } else if (touch_count == 2) {
+                touch_moved = true;
+                // pinza: la variacion de la distancia entre dedos va por el mismo canal que la rueda
+                float dist = Vector2Distance(touch[0], touch[1]);
+                float prev_dist = Vector2Distance(prev_touch[0], prev_touch[1]);
+                zoom += (dist - prev_dist) * 0.05f;
+                // el desplazamiento del punto medio mueve la camara en lateral y vertical (la escena sigue al dedo)
+                Vector2 mid = Vector2Scale(Vector2Add(touch[0], touch[1]), 0.5f);
+                Vector2 prev_mid = Vector2Scale(Vector2Add(prev_touch[0], prev_touch[1]), 0.5f);
+                movement.y -= (mid.x - prev_mid.x) * 0.15f;
+                movement.z += (mid.y - prev_mid.y) * 0.15f;
+            }
+        }
+
+        if (touch_count == 0 && prev_touch_count > 0 && !touch_moved && !touch_on_panel) {
+            // se ha soltado sin arrastrar: toque corto = clic principal, toque largo (0.5 s o mas) = clic secundario
+            if (GetTime() - touch_start_time < 0.5) primary_click = true;
+            else secondary_click = true;
+            aim = touch_start_pos;
+            aim_valid = true;
+        }
+
+        prev_touch_count = touch_count;
+        prev_touch[0] = touch[0];
+        prev_touch[1] = touch[1];
     }
 
     // en modo colocacion la rueda ajusta la distancia del fantasma en lugar del zoom de camara
@@ -1704,7 +1790,7 @@ static void update_draw_frame(void) {
         aim_ray.position.z + aim_ray.direction.z * ghost_dist
     };
 
-    if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && aim_valid) {
+    if (primary_click && aim_valid) {
         if (placing_obstacles) {
             if (num_obstacles < MAX_OBSTACLES) obstacles[num_obstacles++] = ghost;
         } else {
@@ -1719,7 +1805,7 @@ static void update_draw_frame(void) {
     }
 
     // clic derecho en modo colocacion: borrar el obstaculo apuntado
-    if (IsMouseButtonPressed(MOUSE_BUTTON_RIGHT) && placing_obstacles && aim_valid) {
+    if (secondary_click && placing_obstacles && aim_valid) {
         int picked = obstacle_pick_from_ray(aim_ray, obstacles, num_obstacles);
         if (picked >= 0) obstacles[picked] = obstacles[--num_obstacles];
     }
@@ -1824,7 +1910,7 @@ static void update_draw_frame(void) {
     EndMode3D();
 
     // mirilla de referencia para seleccionar boids con la ui oculta
-    if (!show_ui && cfg.show_crosshair) {
+    if (!show_ui && !touch_mode && cfg.show_crosshair) {
         int cx = GetScreenWidth() / 2;
         int cy = GetScreenHeight() / 2;
         DrawLine(cx - 8, cy, cx + 8, cy, Fade(RAYWHITE, 0.7f));
@@ -1832,7 +1918,11 @@ static void update_draw_frame(void) {
     }
 
     // recordatorio de controles del modo colocacion
-    if (placing_obstacles) {
+    if (placing_obstacles && touch_mode) {
+        // en tactil el enlace del shell esta abajo a la izquierda (ver web/shell.html): la ayuda sube para no taparlo
+        DrawText(TextFormat("Toque: colocar  |  Toque largo: borrar  |  Pinza: distancia %.0f", place_distance),
+                 10, GetScreenHeight() - 30 - HUD_TOP_OFFSET, 20, RAYWHITE);
+    } else if (placing_obstacles) {
         DrawText(TextFormat("Colocar: clic izq  |  Borrar: clic dcho  |  Rueda: distancia %.0f  |  Flechas: rotar (yaw %.0f, pitch %.0f)",
                  place_distance, place_yaw * RAD2DEG, place_pitch * RAD2DEG),
                  10, GetScreenHeight() - 30, 20, RAYWHITE);
@@ -1846,7 +1936,10 @@ static void update_draw_frame(void) {
         int pX = GetScreenWidth() - pW - 10; 
         int pY = 10; // Pegado arriba
         
-        GuiPanel((Rectangle){ (float)pX, (float)pY, (float)pW, (float)pH }, "Parameters (TAB to fly)");
+        // la barra de titulo lleva un boton de cierre: en tactil es la unica forma de ocultar el panel (no hay TAB)
+        if (GuiWindowBox((Rectangle){ (float)pX, (float)pY, (float)pW, (float)pH }, touch_mode ? "Parameters" : "Parameters (TAB to fly)")) {
+            ui_set_visible(false);
+        }
 
         // Coordenadas base para los sliders relativas al panel
         int sX = pX + 110;
@@ -2057,7 +2150,10 @@ static void update_draw_frame(void) {
         }
     }
 
-    if (cfg.show_fps) DrawFPS(10, 10);
+    // en tactil, con el panel oculto, un boton flotante para recuperarlo
+    if (!show_ui && touch_mode && GuiButton(touch_show_ui_button_rect(), "Show UI")) ui_set_visible(true);
+
+    if (cfg.show_fps) DrawFPS(10, 10 + HUD_TOP_OFFSET);
     EndDrawing();
 }
 
@@ -2072,6 +2168,16 @@ int main() {
     for (int i = 0; i < 1024; i++) {
         cfg.noise_table[i] = rand_range(-1.0f, 1.0f);
     }
+
+#if defined(PLATFORM_WEB)
+    // movil o tablet: pantalla tactil y puntero grueso (o "?touch" en la url para probar el modo tactil en escritorio)
+    touch_mode = EM_ASM_INT({
+        return ((navigator.maxTouchPoints > 0 && window.matchMedia('(pointer: coarse)').matches)
+                || location.search.indexOf('touch') >= 0) ? 1 : 0;
+    });
+    // en movil hay menos cpu y puede que un solo hilo: se arranca con menos boids (el slider sigue llegando al maximo)
+    if (touch_mode) cfg.num_boids = 10000;
+#endif
 
     // array dinamico para los boids
     boids = malloc(sizeof(boid) * cfg.max_boids);
@@ -2150,8 +2256,7 @@ int main() {
     GuiSetStyle(DEFAULT, TEXT_COLOR_FOCUSED, 0xC9EFFEFF);
     GuiSetStyle(DEFAULT, TEXT_COLOR_PRESSED, 0xC9EFFEFF);
 
-    if (show_ui) EnableCursor();
-    else DisableCursor();
+    ui_set_visible(show_ui);
 
     //creo un cono para un boid
     boidMesh = GenMeshCone(0.18f, 0.6f, 8);
