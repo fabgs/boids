@@ -3,3 +3,6 @@ secretos.txt
 *.snap
 *.cfg
 *.obs
+
+# salida de build_web.* (la publica GitHub Actions)
+dist/

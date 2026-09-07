@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="es">
+<head>
+    <meta charset="utf-8">
+    <title>Boids 3D</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Simulador 3D de boids (flocking) en tiempo real, escrito en C con raylib y compilado a WebAssembly">
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='%235bb2d9' d='M2 13 8 2l6 11-6-3z'/%3E%3C/svg%3E">
+    <style>
+        html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #14161c; }
+        canvas.emscripten { display: block; width: 100vw; height: 100vh; border: 0; outline: none; background: #14161c; }
+        #status {
+            position: fixed; inset: 0; z-index: 10;
+            display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px;
+            padding: 24px; text-align: center;
+            background: #14161c; color: #8fa4b5;
+            font: 15px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+        }
+        #status.hidden { display: none; }
+        #status h1 { margin: 0; font-size: 24px; font-weight: 600; color: #c9effe; }
+        #status .error { color: #e15f46; max-width: 62ch; }
+        #status .hint { color: #5c6b7a; font-size: 13px; max-width: 62ch; }
+        #status progress { width: 260px; accent-color: #5bb2d9; }
+    </style>
+    <!-- GitHub Pages no permite cabeceras personalizadas: este service worker anade COOP/COEP en el cliente para
+         que el navegador habilite SharedArrayBuffer (necesario para los hilos). En servidores que ya envian las
+         cabeceras (web/serve.py, Netlify, Cloudflare Pages...) no hace nada. -->
+    <script src="coi-serviceworker.js"></script>
+</head>
+<body>
+    <div id="status">
+        <h1>Boids 3D</h1>
+        <div id="status-text">Cargando…</div>
+        <progress id="status-progress" value="0" max="100" hidden></progress>
+        <div class="hint">TAB oculta la UI y libera el raton para volar · WASD + raton · P pausa · R reinicia · F11 pantalla completa</div>
+    </div>
+
+    <canvas class="emscripten" id="canvas" oncontextmenu="event.preventDefault()" tabindex="-1"></canvas>
+
+    <script>
+        var statusBox = document.getElementById('status');
+        var statusText = document.getElementById('status-text');
+        var statusProgress = document.getElementById('status-progress');
+
+        function showError(message) {
+            statusBox.classList.remove('hidden');
+            statusProgress.hidden = true;
+            statusText.innerHTML = '<div class="error">' + message + '</div>';
+        }
+
+        if (typeof SharedArrayBuffer === 'undefined') {
+            showError('Este navegador o servidor no permite SharedArrayBuffer, necesario para los hilos de la simulacion. ' +
+                      'El servidor debe enviar las cabeceras Cross-Origin-Opener-Policy: same-origin y ' +
+                      'Cross-Origin-Embedder-Policy: require-corp (o registrar coi-serviceworker.js). Recarga la pagina si es la primera visita.');
+        }
+
+        var Module = {
+            canvas: document.getElementById('canvas'),
+
+            preRun: [function () {
+                // /persist se monta sobre IndexedDB: presets, snapshots y mapas guardados sobreviven a recargas.
+                // main() no arranca hasta que se ha leido el contenido previo (addRunDependency).
+                try {
+                    FS.mkdir('/persist');
+                    FS.mount(IDBFS, {}, '/persist');
+                    addRunDependency('idbfs');
+                    FS.syncfs(true, function (err) {
+                        if (err) console.error('IDBFS: no se pudo cargar el almacenamiento persistente', err);
+                        removeRunDependency('idbfs');
+                    });
+                } catch (e) {
+                    console.error('IDBFS no disponible, los guardados no persistiran entre recargas', e);
+                }
+            }],
+
+            onRuntimeInitialized: function () {
+                statusBox.classList.add('hidden');
+                Module.canvas.focus();
+            },
+
+            setStatus: function (text) {
+                if (!text) return;
+                var match = /(.*)\((\d+(?:\.\d+)?)\/(\d+)\)/.exec(text);
+                if (match) {
+                    statusProgress.hidden = false;
+                    statusProgress.value = parseInt(match[2]) * 100 / parseInt(match[3]);
+                    statusText.textContent = 'Descargando… ' + Math.round(statusProgress.value) + '%';
+                } else {
+                    statusProgress.hidden = true;
+                    statusText.textContent = text;
+                }
+            },
+
+            onAbort: function (what) {
+                showError('La aplicacion se ha detenido: ' + what);
+            },
+
+            print: function (text) { console.log(text); },
+            printErr: function (text) { console.error(text); }
+        };
+
+        window.addEventListener('error', function (event) {
+            if (event.message) showError('Error: ' + event.message);
+        });
+    </script>
+    {{{ SCRIPT }}}
+</body>
+</html>
