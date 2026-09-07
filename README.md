@@ -1,6 +1,8 @@
 # Boids 3D — Real-Time Flocking Simulator
 
-Interactive 3D **boids** (flocking) simulator written in **pure C** with [raylib](https://www.raylib.com/), capable of simulating **thousands of agents in real time** thanks to a uniform spatial grid for neighbor lookups, **OpenMP** parallelization and **GPU instanced rendering** with custom GLSL shaders. The same code also compiles to **WebAssembly** and runs in the browser: see [Web version](#web-version-webassembly).
+Interactive 3D **boids** (flocking) simulator written in **pure C** with [raylib](https://www.raylib.com/), capable of simulating **thousands of agents in real time** thanks to a uniform spatial grid for neighbor lookups, multithreaded force computation (**OpenMP** on desktop, a **pthreads** pool on the web) and **GPU instanced rendering** with custom GLSL shaders. The same code compiles to **WebAssembly** and runs in the browser, desktop or mobile.
+
+**▶ Try it in the browser: [fabgs.dev/boids](https://fabgs.dev/boids/)** · Part of [fabgs.dev](https://fabgs.dev/)
 
 <img width="1917" height="1077" alt="Emergent flocking patterns" src="https://github.com/user-attachments/assets/77356c55-380d-4e06-bea6-08e57bb85d3c" />
 
@@ -21,7 +23,7 @@ Interactive 3D **boids** (flocking) simulator written in **pure C** with [raylib
 
 ### Performance
 - **Uniform spatial grid (spatial hashing)** with per-cell linked lists: neighbor search drops from O(n²) to ~O(n), with dynamic resizing based on world size and vision radius.
-- **OpenMP** in the hot paths (force computation and integration), with atomic sections where needed.
+- **Multithreaded hot paths** (force computation and render matrices) through a small `parallel_for(n, fn, ctx)` abstraction: **OpenMP** on desktop, a persistent **pthreads pool** on the web, sequential fallback otherwise. Shared counters use atomics.
 - **Instanced rendering**: all boids are drawn in a single `DrawMeshInstanced` call with a custom GLSL shader that also smuggles the per-instance color inside the transform matrix to save an extra buffer.
 - Only visible boids are uploaded to the GPU each frame.
 
@@ -98,7 +100,7 @@ What changes on the web, all behind `#if defined(PLATFORM_WEB)`:
 | Presets / snapshots / maps on disk next to the .exe | Virtual filesystem: bundled examples are preloaded, user saves go to `/persist`, mounted on **IndexedDB** so they survive reloads |
 | Fixed 1920x1080 window | Canvas fills the viewport and follows browser resizes; the UI panel compresses its rows if the viewport is shorter than the panel |
 | Keyboard + mouse | On touch devices (coarse pointer) a touch mode kicks in: gesture camera, tap / long press instead of clicks, a floating button instead of `Tab`, and a lower default boid count. Add `?touch` to the URL to force it on desktop |
-| `fabgs.github.io/boids/` | The HTML shell adds a small link back to the portfolio (`/`) |
+| No page navigation | The HTML shell adds a small link back to the portfolio (`/`, i.e. [fabgs.dev](https://fabgs.dev/)) |
 
 ### Building the web version
 
@@ -114,7 +116,7 @@ Output goes to `dist/`. Test it locally with `python web/serve.py` (a plain `htt
 
 ### Performance on the web
 
-Rendering is unchanged (GPU instancing on WebGL 2). Simulation runs at roughly 60-80% of native single-thread speed, compiled with `-msimd128`, and scales with cores through the pthread pool, so the boid count you can hold at 60 fps is somewhat lower than the native build on the same machine.
+Rendering is unchanged (GPU instancing on WebGL 2). The simulation is compiled with `-msimd128` and scales with cores through the pthread pool, but WebAssembly is somewhat slower than native code per thread, so the boid count you can hold at 60 fps is lower than the native build on the same machine. On phones the default boid count drops to 10,000, and browsers that do not report the core count (Safari on iOS) get a 4-thread pool.
 
 ## Project Structure
 
@@ -131,6 +133,7 @@ build_web.bat  # Web (WebAssembly) build script, Windows
 build_web.sh   # Web (WebAssembly) build script, bash
 web/           # HTML shell, coi-serviceworker.js and a local dev server with COOP/COEP headers
 .github/       # GitHub Actions workflow that builds and deploys the web version to Pages
+LICENSE        # MIT
 ```
 
 ## Technical Highlights
@@ -138,3 +141,8 @@ web/           # HTML shell, coi-serviceworker.js and a local dev server with CO
 - **C99 with no external dependencies** beyond raylib: the vector math, spatial grid, SDFs and serialization are all custom implementations.
 - **Defensive I/O validation**: presets and snapshots loaded from disk are sanitized (clamping, NaN checks, memory limits) so a hand-edited or corrupted file can never break the simulation.
 - **Cost-aware memory management**: the grid caps its cells per axis to bound the maximum allocation and reuses allocations across frames.
+- **One codebase, two platforms**: every desktop/web difference is isolated behind `PLATFORM_WEB`, and the native build is unchanged by the port.
+
+## License
+
+MIT, see [LICENSE](LICENSE). Made by [Fabián Godoy](https://fabgs.dev/) ([@fabgs](https://github.com/fabgs)).
