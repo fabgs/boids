@@ -15,6 +15,19 @@
 #include "raygui.h"
 #pragma GCC diagnostic pop
 
+// plataforma web (emscripten): bucle principal dirigido por el navegador, sistema de archivos virtual y pool de hilos.
+// PLATFORM_WEB lo define el script de compilacion (build_web.*), igual que hace raylib; __EMSCRIPTEN_PTHREADS__ lo define emcc con -pthread
+#if defined(PLATFORM_WEB)
+    #include <emscripten/emscripten.h>
+    #if defined(__EMSCRIPTEN_PTHREADS__)
+        #include <emscripten/threading.h>
+        #include <pthread.h>
+        #include <stdint.h>
+    #endif
+#elif defined(_OPENMP)
+    #include <omp.h>
+#endif
+
 typedef enum {
     BOUNDARY_BOUNCE,
     BOUNDARY_WRAP,
@@ -159,8 +172,17 @@ typedef struct{
 
 // el color por instancia viaja de contrabando en la fila inferior de la matriz (m3, m7, m11),
 // que en una transformacion afin siempre es (0, 0, 0, 1); hay que limpiarla antes de proyectar
+// WebGL 2 usa GLSL ES 3.00: misma sintaxis in/out, pero cambia la cabecera y el fragment shader exige declarar precision
+#if defined(PLATFORM_WEB)
+    #define GLSL_VERSION_LINE "#version 300 es\n"
+    #define GLSL_FRAGMENT_PRECISION "precision mediump float;\n"
+#else
+    #define GLSL_VERSION_LINE "#version 330\n"
+    #define GLSL_FRAGMENT_PRECISION ""
+#endif
+
 const char *instancingVS =
-    "#version 330\n"
+    GLSL_VERSION_LINE
     "in vec3 vertexPosition;\n"
     "in vec3 vertexNormal;\n"
     "in mat4 instanceTransform;\n"
@@ -179,7 +201,8 @@ const char *instancingVS =
     "}\n";
 
 const char *instancingFS =
-    "#version 330\n"
+    GLSL_VERSION_LINE
+    GLSL_FRAGMENT_PRECISION
     "in vec3 instanceColor;\n"
     "out vec4 finalColor;\n"
     "void main()\n"
@@ -721,10 +744,140 @@ vec3 boid_compute_avoidance(const boid *b, vec3 fwd_dir, float current_speed, co
     return avoidance;
 }
 
-// calcula las aceleraciones en base a las reglas de reynolds
-void boids_compute_accelerations(boid *boids, const config *cfg, const spatial_grid *g, const obstacle *obstacles, int num_obstacles, float time_sec) {
-    #pragma omp parallel for
-    for (int i = 0; i < cfg->num_boids; i++) {
+// ================= paralelismo =================
+// las dos fases pesadas por frame (reglas de reynolds y matrices de render) se reparten en rangos contiguos de boids
+// entre hilos, uno por nucleo: en nativo con OpenMP, en web con un pool de pthreads de emscripten (SharedArrayBuffer)
+// y, si no hay ninguno de los dos, en secuencial. el reparto en rangos iguales equivale al schedule(static) de OpenMP
+typedef void (*range_fn)(int start, int end, void *ctx);
+
+#if defined(_OPENMP) || (defined(PLATFORM_WEB) && defined(__EMSCRIPTEN_PTHREADS__))
+// rango [start, end) que le toca al hilo chunk_index de chunk_count, en trozos contiguos de tamaño parecido
+static void run_range_chunk(int n, int chunk_index, int chunk_count, range_fn fn, void *ctx) {
+    int chunk = (n + chunk_count - 1) / chunk_count;
+    int start = chunk_index * chunk;
+    int end = start + chunk;
+    if (end > n) end = n;
+    if (start < end) fn(start, end, ctx);
+}
+#endif
+
+#if defined(_OPENMP)
+static void parallel_init(void) {}
+
+static void parallel_for(int n, range_fn fn, void *ctx) {
+    #pragma omp parallel
+    {
+        run_range_chunk(n, omp_get_thread_num(), omp_get_num_threads(), fn, ctx);
+    }
+}
+#elif defined(PLATFORM_WEB) && defined(__EMSCRIPTEN_PTHREADS__)
+// pool persistente: crear hilos por frame es caro y en emscripten ademas asincrono. los workers duermen en una
+// variable de condicion hasta que el hilo principal publica un trabajo (generation++), lo ejecutan y avisan al terminar
+#define POOL_MAX_THREADS 16
+// por debajo de este numero de elementos por hilo no compensa despertar el pool
+#define POOL_MIN_ITEMS_PER_THREAD 64
+
+typedef struct {
+    pthread_t threads[POOL_MAX_THREADS];
+    int num_threads; // incluye al hilo principal, que ejecuta el rango 0
+    pthread_mutex_t mutex;
+    pthread_cond_t start_cond;
+    pthread_cond_t done_cond;
+    unsigned generation;
+    int pending;
+    range_fn fn;
+    void *ctx;
+    int n;
+} thread_pool;
+
+static thread_pool pool;
+
+static void *pool_worker(void *arg) {
+    int index = (int)(intptr_t)arg;
+    unsigned seen = 0;
+    for (;;) {
+        pthread_mutex_lock(&pool.mutex);
+        while (pool.generation == seen) pthread_cond_wait(&pool.start_cond, &pool.mutex);
+        seen = pool.generation;
+        pthread_mutex_unlock(&pool.mutex);
+
+        run_range_chunk(pool.n, index, pool.num_threads, pool.fn, pool.ctx);
+
+        pthread_mutex_lock(&pool.mutex);
+        if (--pool.pending == 0) pthread_cond_signal(&pool.done_cond);
+        pthread_mutex_unlock(&pool.mutex);
+    }
+    return NULL;
+}
+
+static void parallel_init(void) {
+    int cores = emscripten_num_logical_cores();
+    if (cores < 1) cores = 1;
+    if (cores > POOL_MAX_THREADS) cores = POOL_MAX_THREADS;
+
+    pthread_mutex_init(&pool.mutex, NULL);
+    pthread_cond_init(&pool.start_cond, NULL);
+    pthread_cond_init(&pool.done_cond, NULL);
+    pool.num_threads = 1;
+
+    // los workers salen del pool que emscripten precrea al arrancar (-sPTHREAD_POOL_SIZE); si alguno falla se sigue con menos
+    for (int t = 1; t < cores; t++) {
+        if (pthread_create(&pool.threads[t], NULL, pool_worker, (void *)(intptr_t)t) != 0) break;
+        pool.num_threads++;
+    }
+    TraceLog(LOG_INFO, "POOL: %d hilos de simulacion (%d nucleos logicos)", pool.num_threads, cores);
+}
+
+static void parallel_for(int n, range_fn fn, void *ctx) {
+    if (pool.num_threads <= 1 || n < pool.num_threads * POOL_MIN_ITEMS_PER_THREAD) {
+        fn(0, n, ctx);
+        return;
+    }
+
+    pthread_mutex_lock(&pool.mutex);
+    pool.fn = fn;
+    pool.ctx = ctx;
+    pool.n = n;
+    pool.pending = pool.num_threads - 1;
+    pool.generation++;
+    pthread_cond_broadcast(&pool.start_cond);
+    pthread_mutex_unlock(&pool.mutex);
+
+    run_range_chunk(n, 0, pool.num_threads, fn, ctx);
+
+    pthread_mutex_lock(&pool.mutex);
+    while (pool.pending > 0) pthread_cond_wait(&pool.done_cond, &pool.mutex);
+    pthread_mutex_unlock(&pool.mutex);
+}
+#else
+static void parallel_init(void) {}
+
+static void parallel_for(int n, range_fn fn, void *ctx) {
+    fn(0, n, ctx);
+}
+#endif
+
+// argumentos del calculo de reglas para repartirlo por rangos
+typedef struct {
+    boid *boids;
+    const config *cfg;
+    const spatial_grid *g;
+    const obstacle *obstacles;
+    int num_obstacles;
+    float time_sec;
+} accelerations_job;
+
+// calcula las aceleraciones en base a las reglas de reynolds para los boids [start, end)
+static void boids_compute_accelerations_range(int start, int end, void *ctx) {
+    const accelerations_job *job = ctx;
+    boid *boids = job->boids;
+    const config *cfg = job->cfg;
+    const spatial_grid *g = job->g;
+    const obstacle *obstacles = job->obstacles;
+    int num_obstacles = job->num_obstacles;
+    float time_sec = job->time_sec;
+
+    for (int i = start; i < end; i++) {
         boid *observer = &boids[i];
         int total_neighbors = 0; // para saber si estoy solo y frenar
         int visual_neighbors = 0; // para saber a quien seguir
@@ -879,6 +1032,12 @@ void boids_compute_accelerations(boid *boids, const config *cfg, const spatial_g
             observer->acceleration.z += (desired_vel.z - observer->velocity.z) * cfg->agility;
         }
     }
+}
+
+// calcula las aceleraciones de todos los boids repartiendo el trabajo entre hilos
+void boids_compute_accelerations(boid *boids, const config *cfg, const spatial_grid *g, const obstacle *obstacles, int num_obstacles, float time_sec) {
+    accelerations_job job = { boids, cfg, g, obstacles, num_obstacles, time_sec };
+    parallel_for(cfg->num_boids, boids_compute_accelerations_range, &job);
 }
 
 // limite de celdas por eje para que el grid no pida gigas de memoria con mundos grandes y radios de vision pequeños
@@ -1110,6 +1269,23 @@ void debug_draw_vision(const boid *b, const config *cfg) {
 // dimensiones del panel de la ui (tambien usadas para ignorar los clics de seleccion sobre el)
 #define UI_PANEL_WIDTH 340
 #define UI_PANEL_HEIGHT 1061
+// separacion vertical entre filas de controles y cuantas filas la usan (para poder comprimir el panel)
+#define UI_ROW_SPACE 26
+#define UI_ROW_SPACE_MIN 21
+#define UI_ROW_COUNT 38
+
+// si la ventana es mas baja que el panel (p. ej. el viewport de un navegador a 1080p) se juntan las filas para que quepa
+static int ui_row_space(void) {
+    int overflow = UI_PANEL_HEIGHT + 20 - GetScreenHeight();
+    if (overflow <= 0) return UI_ROW_SPACE;
+    int space = UI_ROW_SPACE - (overflow + UI_ROW_COUNT - 1) / UI_ROW_COUNT;
+    return (space < UI_ROW_SPACE_MIN) ? UI_ROW_SPACE_MIN : space;
+}
+
+// alto real del panel con la separacion de filas actual
+static int ui_panel_height(void) {
+    return UI_PANEL_HEIGHT - (UI_ROW_SPACE - ui_row_space()) * UI_ROW_COUNT;
+}
 
 // tolerancia angular del picking (~1 grado): un boid lejano ocupa un par de pixeles,
 // asi que se acepta todo lo que quede dentro de un pequeño cono alrededor del cursor
@@ -1202,8 +1378,90 @@ void camera_follow_boid(Camera3D *camera, const boid *b, camera_mode mode, float
     camera->up = (dir.x * dir.x + dir.z * dir.z < 0.001f) ? (Vector3){0.0f, 0.0f, 1.0f} : (Vector3){0.0f, 1.0f, 0.0f};
 }
 
-int main() {
-    config cfg = {
+// argumentos del calculo de matrices de render para repartirlo por rangos
+typedef struct {
+    boid *boids;
+    const config *cfg;
+    camera_mode cam_mode;
+    int followed_boid;
+    frustum fr;
+    Matrix *transforms;
+    int *visible_count; // contador compartido entre hilos
+} transforms_job;
+
+// rellena las matrices (con el color de contrabando) de los boids visibles en [start, end), compactadas en el array
+static void boid_transforms_range(int start, int end, void *ctx) {
+    const transforms_job *job = ctx;
+    const config *cfg = job->cfg;
+
+    for (int i = start; i < end; i++) {
+        boid *b = &job->boids[i];
+
+        // en primera persona el boid seguido no se dibuja para no tapar la vista
+        if (job->cam_mode == CAM_MODE_FIRST_PERSON && i == job->followed_boid) continue;
+
+        if (!frustum_contains_sphere(&job->fr, b->position, BOID_BOUNDING_RADIUS)) continue;
+
+        //la dirección en la que vuela el boid normalizada (la longitud se reutiliza para el heatmap)
+        float speed = sqrtf(vec3_length2(b->velocity));
+        vec3 dir = (speed > 0.0f) ? vec3_scale(b->velocity, 1.0f / speed) : (vec3){0.0f, 0.0f, 0.0f};
+        Matrix transform = boid_transform(b->position, dir);
+
+        // color por instancia inyectado en la fila libre de la matriz (m3, m7, m11)
+        vec3 color = BOID_BASE_COLOR;
+        if (cfg->show_speed_heatmap) {
+            float t = (speed - cfg->min_speed) / fmaxf(cfg->max_speed - cfg->min_speed, 0.001f);
+            color = speed_heatmap_color(clamp_float(t, 0.0f, 1.0f));
+        }
+        transform.m3 = color.x;
+        transform.m7 = color.y;
+        transform.m11 = color.z;
+
+        //reservar hueco en el array compactado de boids visibles (atomico: varios hilos compactan a la vez)
+        int slot = __atomic_fetch_add(job->visible_count, 1, __ATOMIC_RELAXED);
+        job->transforms[slot] = transform;
+    }
+}
+
+// ================= almacenamiento =================
+#if defined(PLATFORM_WEB)
+// en web los ficheros viven en el sistema de archivos virtual de emscripten: /persist esta montado sobre IndexedDB
+// desde web/shell.html (sobrevive a recargas) y /bundled contiene los ejemplos empaquetados con --preload-file
+#define WEB_PERSIST_DIR "/persist"
+#define WEB_BUNDLED_DIR "/bundled"
+
+// copia los ficheros empaquetados que aun no existan en la carpeta persistente (no pisa los guardados del usuario)
+static void web_copy_bundled(const char *bundled_dir, const char *dest_dir, const char *extension) {
+    if (!DirectoryExists(bundled_dir)) return;
+    FilePathList files = LoadDirectoryFilesEx(bundled_dir, extension, false);
+    for (unsigned int i = 0; i < files.count; i++) {
+        char dest[600];
+        snprintf(dest, sizeof(dest), "%s/%s", dest_dir, GetFileName(files.paths[i]));
+        if (FileExists(dest)) continue;
+        int size = 0;
+        unsigned char *data = LoadFileData(files.paths[i], &size);
+        if (data != NULL) {
+            SaveFileData(dest, data, size);
+            UnloadFileData(data);
+        }
+    }
+    UnloadDirectoryFiles(files);
+}
+
+// vuelca los cambios del sistema de archivos virtual a IndexedDB (asincrono, no bloquea el frame)
+static void storage_sync(void) {
+    EM_ASM({ FS.syncfs(false, function(err) { if (err) console.error("syncfs:", err); }); });
+}
+#else
+// en nativo se escribe directamente en disco, no hay nada que sincronizar
+static void storage_sync(void) {}
+#endif
+
+// ================= estado de la aplicacion =================
+// vive a nivel de fichero (y no como locales de main) porque en web el navegador invoca cada frame por callback
+// (emscripten_set_main_loop) y la pila de main no sobrevive entre frames; en nativo main simplemente llama al frame en bucle
+
+static config cfg = {
         .num_boids = 50000,
         .max_boids = 100000,
         .min_speed = 5.0f,
@@ -1228,11 +1486,584 @@ int main() {
         .show_speed_heatmap = false,
     };
 
+// semilla configurable desde la ui
+static int seed = 1;
+
+static boid *boids = NULL;
+static spatial_grid grid;
+
+static bool show_ui = true;
+static bool is_paused = false;
+static bool seed_edit_mode = false;
+
+// camara: modo actual, boid seguido y distancia de la vista en tercera persona
+static camera_mode cam_mode = CAM_MODE_FREE;
+static int followed_boid = -1;
+static float follow_distance = 8.0f;
+
+// presets (.cfg): carpeta, lista de ficheros y estado de los controles
+static char presets_dir[512];
+static char preset_names[FILE_LIST_MAX_COUNT][FILE_LIST_MAX_NAME];
+static char preset_dropdown_text[1024];
+static int preset_count = 0;
+static int preset_selected = 0;
+static bool preset_edit_mode = false;
+static char preset_name_input[FILE_LIST_MAX_NAME] = "";
+static bool preset_name_edit_mode = false;
+
+// snapshots (.snap): estado completo de la simulacion
+static char snapshots_dir[512];
+static char snapshot_names[FILE_LIST_MAX_COUNT][FILE_LIST_MAX_NAME];
+static char snapshot_dropdown_text[1024];
+static int snapshot_count = 0;
+static int snapshot_selected = 0;
+static bool snapshot_edit_mode = false;
+static char snapshot_name_input[FILE_LIST_MAX_NAME] = "";
+static bool snapshot_name_edit_mode = false;
+
+// obstaculos colocados en tiempo real y estado del modo de colocacion
+static obstacle obstacles[MAX_OBSTACLES];
+static int num_obstacles = 0;
+static bool placing_obstacles = false;
+static int place_type = OBSTACLE_SPHERE; // figura seleccionada en el desplegable
+static float place_distance = 40.0f; // distancia de la camara a la superficie mas cercana del fantasma
+static float place_radius = 10.0f;
+static float place_yaw = 0.0f;
+static float place_pitch = 0.0f;
+
+// mapas de obstaculos (.obs)
+static char obstacles_dir[512];
+static char obstacle_map_names[FILE_LIST_MAX_COUNT][FILE_LIST_MAX_NAME];
+static char obstacle_map_dropdown_text[1024];
+static int obstacle_map_count = 0;
+static int obstacle_map_selected = 0;
+static bool obstacle_map_edit_mode = false;
+static char obstacle_map_name_input[FILE_LIST_MAX_NAME] = "";
+static bool obstacle_map_name_edit_mode = false;
+
+// paso y reloj de la simulacion fijos, para que no dependan del framerate real y sea reproducible
+static const float sim_dt = 1.0f / 60.0f;
+static float sim_time = 0.0f;
+// tiempo real acumulado pendiente de simular (ver update_draw_frame)
+static float sim_accum = 0.0f;
+
+// cache de render: las matrices solo se recalculan si la simulacion avanza o cambia la vista
+static int visible_boids = 0;
+static int prev_num_boids = -1;
+static bool transforms_dirty = true;
+
+// recursos graficos
+static Mesh boidMesh;
+static Mesh obstacleMeshes[OBSTACLE_TYPE_COUNT];
+static Material obstacleMaterial;
+static Material boidMaterial;
+static Shader shader;
+static Matrix *boidTransforms = NULL;
+static Camera3D camera = {0};
+
+// dibuja la malla unitaria de un tipo de obstaculo en alambre con la transformacion dada
+static void draw_obstacle_wires(int type, Matrix transform, Color color) {
+#if defined(PLATFORM_WEB)
+    // OpenGL ES / WebGL no tienen glPolygonMode (rlEnableWireMode no hace nada): se emiten las aristas de cada
+    // triangulo como lineas por el batch de rlgl, que ya gestiona el desbordamiento del buffer
+    const Mesh *mesh = &obstacleMeshes[type];
+    rlPushMatrix();
+    rlMultMatrixf(MatrixToFloat(transform));
+    rlBegin(RL_LINES);
+    rlColor4ub(color.r, color.g, color.b, color.a);
+    for (int t = 0; t < mesh->triangleCount; t++) {
+        int idx[3];
+        for (int k = 0; k < 3; k++) idx[k] = mesh->indices ? mesh->indices[t * 3 + k] : t * 3 + k;
+        for (int k = 0; k < 3; k++) {
+            const float *a = &mesh->vertices[idx[k] * 3];
+            const float *b = &mesh->vertices[idx[(k + 1) % 3] * 3];
+            rlVertex3f(a[0], a[1], a[2]);
+            rlVertex3f(b[0], b[1], b[2]);
+        }
+    }
+    rlEnd();
+    rlPopMatrix();
+#else
+    rlEnableWireMode();
+    obstacleMaterial.maps[MATERIAL_MAP_ALBEDO].color = color;
+    DrawMesh(obstacleMeshes[type], obstacleMaterial, transform);
+    rlDisableWireMode();
+#endif
+}
+
+// ================= bucle principal =================
+// un frame completo: entrada, simulacion, matrices de render, dibujo y ui
+static void update_draw_frame(void) {
+    float dt = GetFrameTime();
+
+    // mientras se edita un campo de texto, el teclado no debe disparar atajos ni mover la camara
+    bool typing = seed_edit_mode || preset_name_edit_mode || snapshot_name_edit_mode || obstacle_map_name_edit_mode;
+
+    if (!typing) simulation_handle_input(&cfg, &is_paused);
+
+    // reinicio rápido de la simulación (deshabilitado mientras se edita algun campo de texto)
+    if (IsKeyPressed(KEY_R) && !typing) {
+        boids_reset(boids, &cfg, seed, &sim_time);
+        transforms_dirty = true;
+    }
+
+    // alternar modo de camara
+    if (IsKeyPressed(KEY_C) && !typing) {
+        camera_mode_cycle(&cam_mode, &followed_boid, cfg.num_boids);
+        transforms_dirty = true;
+    }
+
+    // alternar modo de colocacion de obstaculos
+    if (IsKeyPressed(KEY_O) && !typing) placing_obstacles = !placing_obstacles;
+
+    // si el boid seguido deja de existir (slider de num boids o carga de snapshot), volver a camara libre
+    if (followed_boid >= cfg.num_boids) {
+        followed_boid = -1;
+        cam_mode = CAM_MODE_FREE;
+    }
+
+    bool following = (cam_mode != CAM_MODE_FREE && followed_boid >= 0);
+
+    //UpdateCamera(&camera, CAMERA_FREE); //camara antes
+    //velocidad de la camara
+    float base_speed = 150.0f;
+    
+    // Sprint al mantener Control
+    if (IsKeyDown(KEY_LEFT_CONTROL)) base_speed *= 3.0f; 
+    
+    float cam_speed = base_speed * dt;
+
+    Vector3 movement = {0};
+    if (!typing) {
+        if (IsKeyDown(KEY_W)) movement.x += cam_speed;
+        if (IsKeyDown(KEY_S)) movement.x -= cam_speed;
+        if (IsKeyDown(KEY_D)) movement.y += cam_speed;
+        if (IsKeyDown(KEY_A)) movement.y -= cam_speed;
+
+        // espacio y shift para subir y bajar
+        if (IsKeyDown(KEY_SPACE)) movement.z += cam_speed;
+        if (IsKeyDown(KEY_LEFT_SHIFT)) movement.z -= cam_speed;
+    }
+
+    // desactivar ui
+    if (IsKeyPressed(KEY_TAB) && !typing) {
+        show_ui = !show_ui;
+        if (show_ui) EnableCursor();
+        else DisableCursor();
+    }
+
+    // pantalla completa (ventana sin bordes a resolucion del monitor)
+    if (IsKeyPressed(KEY_F11)) ToggleBorderlessWindowed();
+
+    // rotación con el ratón (solo si la ui esta oculta)
+    Vector3 rotation = {0};
+    if (!show_ui) {
+        Vector2 mouseDelta = GetMouseDelta();
+        rotation.x = mouseDelta.x * 0.1f;
+        rotation.y = mouseDelta.y * 0.1f;
+    }
+
+    // zoom con la rueda
+    float zoom = GetMouseWheelMove() * 2.0f;
+
+    // punto de apuntado compartido por seleccion de boids y colocacion de obstaculos:
+    // con la ui visible es el cursor (fuera del panel), con la ui oculta el centro de la pantalla
+    Vector2 aim = { GetScreenWidth() * 0.5f, GetScreenHeight() * 0.5f };
+    bool aim_valid = true;
+
+    if (show_ui) {
+        aim = GetMousePosition();
+        Rectangle panel_rect = { (float)(GetScreenWidth() - UI_PANEL_WIDTH - 10), 10.0f, (float)UI_PANEL_WIDTH, (float)ui_panel_height() };
+        aim_valid = !CheckCollisionPointRec(aim, panel_rect);
+    }
+
+    // en modo colocacion la rueda ajusta la distancia del fantasma en lugar del zoom de camara
+    if (placing_obstacles) {
+        place_distance = clamp_float(place_distance + zoom * 2.5f, 5.0f, 300.0f);
+        zoom = 0.0f;
+
+        // flechas para rotar la figura antes de colocarla
+        if (!typing) {
+            float rot = 1.5f * dt;
+            if (IsKeyDown(KEY_RIGHT)) place_yaw += rot;
+            if (IsKeyDown(KEY_LEFT)) place_yaw -= rot;
+            if (IsKeyDown(KEY_UP)) place_pitch += rot;
+            if (IsKeyDown(KEY_DOWN)) place_pitch -= rot;
+            if (place_yaw > PI) place_yaw -= 2.0f * PI; else if (place_yaw < -PI) place_yaw += 2.0f * PI;
+            if (place_pitch > PI) place_pitch -= 2.0f * PI; else if (place_pitch < -PI) place_pitch += 2.0f * PI;
+        }
+    }
+
+    Ray aim_ray = GetScreenToWorldRay(aim, camera);
+    // el fantasma se proyecta por delante de la camara: la distancia se mide hasta su superficie, no a su centro
+    obstacle ghost = { (obstacle_type)place_type, {0.0f, 0.0f, 0.0f}, place_radius, place_yaw, place_pitch };
+    float ghost_dist = place_distance + obstacle_bounding_radius(&ghost);
+    ghost.position = (vec3){
+        aim_ray.position.x + aim_ray.direction.x * ghost_dist,
+        aim_ray.position.y + aim_ray.direction.y * ghost_dist,
+        aim_ray.position.z + aim_ray.direction.z * ghost_dist
+    };
+
+    if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && aim_valid) {
+        if (placing_obstacles) {
+            if (num_obstacles < MAX_OBSTACLES) obstacles[num_obstacles++] = ghost;
+        } else {
+            int picked = boid_pick_from_ray(aim_ray, boids, cfg.num_boids);
+            if (picked >= 0) {
+                followed_boid = picked;
+                if (cam_mode == CAM_MODE_FREE) cam_mode = CAM_MODE_THIRD_PERSON;
+                following = true;
+                transforms_dirty = true;
+            }
+        }
+    }
+
+    // clic derecho en modo colocacion: borrar el obstaculo apuntado
+    if (IsMouseButtonPressed(MOUSE_BUTTON_RIGHT) && placing_obstacles && aim_valid) {
+        int picked = obstacle_pick_from_ray(aim_ray, obstacles, num_obstacles);
+        if (picked >= 0) obstacles[picked] = obstacles[--num_obstacles];
+    }
+
+    if (!following) {
+        camera.up = (Vector3){0.0f, 1.0f, 0.0f};
+        // zoom negado: para UpdateCameraPro positivo aleja, pero rueda hacia delante debe acercar
+        UpdateCameraPro(&camera, movement, rotation, -zoom);
+    } else {
+        // en modo seguimiento la rueda ajusta la distancia de la tercera persona
+        follow_distance = clamp_float(follow_distance - zoom, 2.0f, 60.0f);
+    }
+
+    // el paso de simulacion es fijo (sim_dt) y se da como mucho una vez por frame, sin recuperar frames perdidos.
+    // el acumulador hace que a mas de 60 fps (en web el navegador dibuja a la frecuencia del monitor, p. ej. 144 Hz)
+    // se salten frames de simulacion y la media siga siendo 60 pasos/s; a 60 fps o menos equivale a un paso por frame.
+    // el margen del 10% evita que el jitter del frametime salte pasos a 60 fps
+    bool step_now = false;
+    if (!is_paused) {
+        sim_accum += dt;
+        if (sim_accum > 2.0f * sim_dt) sim_accum = 2.0f * sim_dt;
+        if (sim_accum >= sim_dt * 0.9f) {
+            sim_accum -= sim_dt;
+            step_now = true;
+        }
+    } else {
+        sim_accum = 0.0f;
+    }
+
+    if (step_now) {
+        //rellenar grid
+        grid_build(&grid, boids, &cfg);
+        //avanzar el reloj de simulación con un paso fijo (no el tiempo real de reloj)
+        sim_time += sim_dt;
+        //calculo de reglas (separacion, alineacion, cohesion)
+        boids_compute_accelerations(boids, &cfg, &grid, obstacles, num_obstacles, sim_time);
+        //actualizacion de boids
+        boids_update(boids, &cfg, obstacles, num_obstacles, sim_dt);
+    }
+
+    // la camara se pega al boid despues de moverlo para no ir un frame por detras
+    if (following) camera_follow_boid(&camera, &boids[followed_boid], cam_mode, follow_distance);
+
+    // solo se recalculan matrices si los boids se han movido o la vista ha cambiado
+    bool camera_moved = (movement.x != 0.0f) || (movement.y != 0.0f) || (movement.z != 0.0f)
+                     || (rotation.x != 0.0f) || (rotation.y != 0.0f) || (zoom != 0.0f) || IsWindowResized();
+
+    if (step_now || camera_moved || cfg.num_boids != prev_num_boids || transforms_dirty) {
+        // planos del frustum para descartar los boids que la camara no ve
+        Matrix view = GetCameraMatrix(camera);
+        float aspect = (float)GetScreenWidth() / (float)GetScreenHeight();
+        Matrix proj = MatrixPerspective(camera.fovy * DEG2RAD, aspect, CAMERA_NEAR_PLANE, CAMERA_FAR_PLANE);
+        frustum fr = frustum_from_view_projection(MatrixMultiply(view, proj));
+
+        visible_boids = 0;
+        transforms_job job = { boids, &cfg, cam_mode, followed_boid, fr, boidTransforms, &visible_boids };
+        parallel_for(cfg.num_boids, boid_transforms_range, &job);
+
+        prev_num_boids = cfg.num_boids;
+        transforms_dirty = false;
+    }
+
+    BeginDrawing();
+    ClearBackground((Color){20, 22, 28, 255});
+
+    BeginMode3D(camera);
+
+    // dibujar el suelo y los limites del mundo
+    //DrawGrid(20, 1.0f);
+    if (cfg.show_world_bounds) {
+        DrawCubeWires(
+            (Vector3){0.0f, 0.0f, 0.0f},
+            cfg.world_size * 2.0f,
+            cfg.world_size * 2.0f,
+            cfg.world_size * 2.0f,
+            GRAY
+        );
+    }
+
+    //dibujado directo de los boids visibles
+    if (visible_boids > 0) DrawMeshInstanced(boidMesh, boidMaterial, boidTransforms, visible_boids);
+
+    // obstaculos activos: relleno translucido mas pasada en alambre para perfilar la figura
+    for (int i = 0; i < num_obstacles; i++) {
+        Matrix obs_transform = obstacle_draw_transform(&obstacles[i]);
+        obstacleMaterial.maps[MATERIAL_MAP_ALBEDO].color = Fade(OBSTACLE_COLOR, 0.35f);
+        DrawMesh(obstacleMeshes[obstacles[i].type], obstacleMaterial, obs_transform);
+        draw_obstacle_wires(obstacles[i].type, obs_transform, Fade(OBSTACLE_COLOR, 0.8f));
+    }
+
+    // fantasma de previsualizacion del obstaculo a colocar
+    if (placing_obstacles && aim_valid && num_obstacles < MAX_OBSTACLES) {
+        draw_obstacle_wires(ghost.type, obstacle_draw_transform(&ghost), Fade(GREEN, 0.6f));
+    }
+
+    // overlays de debug: celdas ocupadas del grid y vision del boid seguido
+    if (cfg.show_grid) debug_draw_grid(&grid);
+    if (cfg.show_vision && followed_boid >= 0 && followed_boid < cfg.num_boids) {
+        debug_draw_vision(&boids[followed_boid], &cfg);
+    }
+
+    EndMode3D();
+
+    // mirilla de referencia para seleccionar boids con la ui oculta
+    if (!show_ui && cfg.show_crosshair) {
+        int cx = GetScreenWidth() / 2;
+        int cy = GetScreenHeight() / 2;
+        DrawLine(cx - 8, cy, cx + 8, cy, Fade(RAYWHITE, 0.7f));
+        DrawLine(cx, cy - 8, cx, cy + 8, Fade(RAYWHITE, 0.7f));
+    }
+
+    // recordatorio de controles del modo colocacion
+    if (placing_obstacles) {
+        DrawText(TextFormat("Colocar: clic izq  |  Borrar: clic dcho  |  Rueda: distancia %.0f  |  Flechas: rotar (yaw %.0f, pitch %.0f)",
+                 place_distance, place_yaw * RAD2DEG, place_pitch * RAD2DEG),
+                 10, GetScreenHeight() - 30, 20, RAYWHITE);
+    }
+
+    if (show_ui) {
+        int pW = UI_PANEL_WIDTH;
+        int pH = ui_panel_height();
+        
+        // Ancho total de pantalla, menos el ancho del panel, menos 10 píxeles de margen
+        int pX = GetScreenWidth() - pW - 10; 
+        int pY = 10; // Pegado arriba
+        
+        GuiPanel((Rectangle){ (float)pX, (float)pY, (float)pW, (float)pH }, "Parameters (TAB to fly)");
+
+        // Coordenadas base para los sliders relativas al panel
+        int sX = pX + 110;
+        int sY = pY + 40;
+        int sW = 160;
+        int sH = 15;
+        int space = ui_row_space();
+
+        // ancho de fila para los controles con boton lateral (nombre/desplegable + Save/Load), alineado con el resto de la ui
+        int rowGap = 10;
+        int rowBtnW = 55;
+        int rowFieldW = sW + 10 - rowGap - rowBtnW;
+
+        // Número de Boids
+        float active_boids = (float)cfg.num_boids;
+        GuiSliderBar((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH }, "Num Boids", TextFormat("%d", cfg.num_boids), &active_boids, 100.0f, (float)cfg.max_boids);
+        cfg.num_boids = (int)active_boids;
+
+        // Tamaño del Mundo
+        sY += space;
+        GuiSliderBar((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH }, "World Size", TextFormat("%.0f", cfg.world_size), &cfg.world_size, 50.0f, 400.0f);
+
+        // Comportamiento de los boids
+        sY += space;
+        GuiSliderBar((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH }, "Min Speed", TextFormat("%.1f", cfg.min_speed), &cfg.min_speed, 1.0f, 20.0f);
+
+        sY += space;
+        GuiSliderBar((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH }, "Max Speed", TextFormat("%.1f", cfg.max_speed), &cfg.max_speed, 10.0f, 50.0f);
+
+        sY += space;
+        GuiSliderBar((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH }, "Vision Radius", TextFormat("%.1f", cfg.vision_radius), &cfg.vision_radius, 1.0f, 50.0f);
+        
+        sY += space;
+        GuiSliderBar((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH }, "Blind Angle", TextFormat("%.2f rad", cfg.blind_angle), &cfg.blind_angle, 0.0f, PI);
+        cfg.cos_blind_angle = cosf(PI - cfg.blind_angle); 
+
+        sY += space;
+        GuiSliderBar((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH }, "Separation", TextFormat("%.2f", cfg.separation_weight), &cfg.separation_weight, 0.0f, 2.0f);
+        
+        sY += space;
+        GuiSliderBar((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH }, "Alignment", TextFormat("%.2f", cfg.alignment_weight), &cfg.alignment_weight, 0.0f, 2.0f);
+        
+        sY += space;
+        GuiSliderBar((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH }, "Cohesion", TextFormat("%.2f", cfg.cohesion_weight), &cfg.cohesion_weight, 0.0f, 2.0f);
+        
+        sY += space;
+        GuiSliderBar((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH }, "Wander", TextFormat("%.2f", cfg.wander_weight), &cfg.wander_weight, 0.0f, 1.0f);
+        
+        sY += space;
+        GuiSliderBar((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH }, "Urgency", TextFormat("%.2f", cfg.urgency_multiplier), &cfg.urgency_multiplier, 0.01f, 1.0f);
+        
+        sY += space;
+        GuiSliderBar((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH }, "Agility", TextFormat("%.1f", cfg.agility), &cfg.agility, 0.1f, 10.0f);
+
+        sY += space;
+        GuiSliderBar((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH }, "Avoidance", TextFormat("%.2f", cfg.avoid_weight), &cfg.avoid_weight, 0.0f, 3.0f);
+
+        // Comportamiento de bordes: BOUNCE -> WRAP -> STEER (evasion suave)
+        sY += space;
+        if (GuiButton((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH }, TextFormat("Boundary: %s (B)", boundary_mode_to_string(cfg.boundary_mode)))) {
+            cfg.boundary_mode = (cfg.boundary_mode + 1) % 3;
+        }
+
+        // pausar/reanudar la simulacion
+        sY += space;
+        GuiCheckBox((Rectangle){ (float)sX, (float)sY, 15, 15 }, "Paused (P to toggle)", &is_paused);
+
+        // semilla del rng
+        sY += space;
+        if (GuiValueBox((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH }, "Seed", &seed, 0, 999999, seed_edit_mode)) {
+            seed_edit_mode = !seed_edit_mode;
+        }
+
+        // reset de la simulacion con la semilla actual
+        sY += space;
+        if (GuiButton((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH + 10 }, "Reset Simulation (R)")) {
+            boids_reset(boids, &cfg, seed, &sim_time);
+            transforms_dirty = true;
+        }
+
+        // alternar modo de camara (libre / 1a persona / 3a persona)
+        sY += space;
+        const char *cam_label = (cam_mode == CAM_MODE_FREE) ? "Camera: Free (C)"
+                              : (cam_mode == CAM_MODE_FIRST_PERSON) ? TextFormat("Camera: 1st #%d (C)", followed_boid)
+                              : TextFormat("Camera: 3rd #%d (C)", followed_boid);
+        if (GuiButton((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH + 10 }, cam_label)) {
+            camera_mode_cycle(&cam_mode, &followed_boid, cfg.num_boids);
+            transforms_dirty = true;
+        }
+
+        // elegir un boid aleatorio a seguir (tambien se puede clicar un boid en el mundo)
+        sY += space + 10;
+        if (GuiButton((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH + 10 }, "Follow Random Boid") && cfg.num_boids > 0) {
+            followed_boid = rand() % cfg.num_boids;
+            if (cam_mode == CAM_MODE_FREE) cam_mode = CAM_MODE_THIRD_PERSON;
+            transforms_dirty = true;
+        }
+
+        // nombre bajo el que se guardara la config actual como preset, con su boton de guardado al lado
+        sY += space + 10;
+        GuiLine((Rectangle){ (float)(pX + 10), (float)(sY - 8), (float)(pW - 20), 10 }, "Preset");
+        sY += space - 10;
+        if (GuiTextBox((Rectangle){ (float)sX, (float)sY, (float)rowFieldW, (float)sH }, preset_name_input, FILE_LIST_MAX_NAME, preset_name_edit_mode)) {
+            preset_name_edit_mode = !preset_name_edit_mode;
+        }
+        if (GuiButton((Rectangle){ (float)(sX + rowFieldW + rowGap), (float)sY, (float)rowBtnW, (float)sH }, "Save") && preset_name_input[0] != '\0') {
+            char filepath[600];
+            snprintf(filepath, sizeof(filepath), "%s/%s.cfg", presets_dir, preset_name_input);
+            config_save_preset(&cfg, filepath);
+            storage_sync();
+            preset_count = refresh_file_list(presets_dir, ".cfg", preset_names, preset_dropdown_text, sizeof(preset_dropdown_text), "(sin presets)");
+            if (preset_selected >= preset_count) preset_selected = (preset_count > 0) ? preset_count - 1 : 0;
+        }
+
+        // desplegable de presets guardados, con su boton de carga al lado
+        sY += space;
+        Rectangle presetDropdownRect = { (float)sX, (float)sY, (float)rowFieldW, (float)sH };
+        if (GuiButton((Rectangle){ (float)(sX + rowFieldW + rowGap), (float)sY, (float)rowBtnW, (float)sH }, "Load") && preset_count > 0) {
+            char filepath[600];
+            snprintf(filepath, sizeof(filepath), "%s/%s.cfg", presets_dir, preset_names[preset_selected]);
+            config_load_preset(&cfg, filepath);
+        }
+
+        // snapshots: guardan la config y la posicion/velocidad/aceleracion de todos los boids con nombre propio para retomar la simulacion despues
+        sY += space + 10;
+        GuiLine((Rectangle){ (float)(pX + 10), (float)(sY - 8), (float)(pW - 20), 10 }, "Snapshot");
+        sY += space - 10;
+        if (GuiTextBox((Rectangle){ (float)sX, (float)sY, (float)rowFieldW, (float)sH }, snapshot_name_input, FILE_LIST_MAX_NAME, snapshot_name_edit_mode)) {
+            snapshot_name_edit_mode = !snapshot_name_edit_mode;
+        }
+        if (GuiButton((Rectangle){ (float)(sX + rowFieldW + rowGap), (float)sY, (float)rowBtnW, (float)sH }, "Save") && snapshot_name_input[0] != '\0') {
+            char filepath[600];
+            snprintf(filepath, sizeof(filepath), "%s/%s.snap", snapshots_dir, snapshot_name_input);
+            boids_save_state(boids, &cfg, obstacles, num_obstacles, sim_time, filepath);
+            storage_sync();
+            snapshot_count = refresh_file_list(snapshots_dir, ".snap", snapshot_names, snapshot_dropdown_text, sizeof(snapshot_dropdown_text), "(sin snapshots)");
+            if (snapshot_selected >= snapshot_count) snapshot_selected = (snapshot_count > 0) ? snapshot_count - 1 : 0;
+        }
+
+        sY += space;
+        Rectangle snapshotDropdownRect = { (float)sX, (float)sY, (float)rowFieldW, (float)sH };
+        if (GuiButton((Rectangle){ (float)(sX + rowFieldW + rowGap), (float)sY, (float)rowBtnW, (float)sH }, "Load") && snapshot_count > 0) {
+            char filepath[600];
+            snprintf(filepath, sizeof(filepath), "%s/%s.snap", snapshots_dir, snapshot_names[snapshot_selected]);
+            if (boids_load_state(boids, &cfg, &sim_time, obstacles, &num_obstacles, filepath)) transforms_dirty = true;
+        }
+
+        // obstaculos: modo de colocacion con el raton, radio y mapas guardables por separado
+        sY += space + 10;
+        GuiLine((Rectangle){ (float)(pX + 10), (float)(sY - 8), (float)(pW - 20), 10 }, "Obstacles");
+        sY += space - 10;
+        GuiCheckBox((Rectangle){ (float)sX, (float)sY, 15, 15 }, TextFormat("Place mode (O)  %d/%d", num_obstacles, MAX_OBSTACLES), &placing_obstacles);
+        sY += space;
+        GuiComboBox((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH }, "Sphere;Cube;Donut;Cylinder", &place_type);
+        sY += space;
+        GuiSliderBar((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH }, "Radius", TextFormat("%.1f", place_radius), &place_radius, 1.0f, 50.0f);
+        sY += space;
+        if (GuiButton((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH }, "Clear Obstacles")) num_obstacles = 0;
+        sY += space;
+        if (GuiTextBox((Rectangle){ (float)sX, (float)sY, (float)rowFieldW, (float)sH }, obstacle_map_name_input, FILE_LIST_MAX_NAME, obstacle_map_name_edit_mode)) {
+            obstacle_map_name_edit_mode = !obstacle_map_name_edit_mode;
+        }
+        if (GuiButton((Rectangle){ (float)(sX + rowFieldW + rowGap), (float)sY, (float)rowBtnW, (float)sH }, "Save") && obstacle_map_name_input[0] != '\0') {
+            char filepath[600];
+            snprintf(filepath, sizeof(filepath), "%s/%s.obs", obstacles_dir, obstacle_map_name_input);
+            obstacles_save_map(obstacles, num_obstacles, filepath);
+            storage_sync();
+            obstacle_map_count = refresh_file_list(obstacles_dir, ".obs", obstacle_map_names, obstacle_map_dropdown_text, sizeof(obstacle_map_dropdown_text), "(sin mapas)");
+            if (obstacle_map_selected >= obstacle_map_count) obstacle_map_selected = (obstacle_map_count > 0) ? obstacle_map_count - 1 : 0;
+        }
+
+        sY += space;
+        Rectangle obstacleMapDropdownRect = { (float)sX, (float)sY, (float)rowFieldW, (float)sH };
+        if (GuiButton((Rectangle){ (float)(sX + rowFieldW + rowGap), (float)sY, (float)rowBtnW, (float)sH }, "Load") && obstacle_map_count > 0) {
+            char filepath[600];
+            snprintf(filepath, sizeof(filepath), "%s/%s.obs", obstacles_dir, obstacle_map_names[obstacle_map_selected]);
+            obstacles_load_map(obstacles, &num_obstacles, filepath);
+        }
+
+        // seccion de debug: overlays de visualizacion en tiempo real
+        sY += space + 10;
+        GuiLine((Rectangle){ (float)(pX + 10), (float)(sY - 8), (float)(pW - 20), 10 }, "Debug");
+        sY += space - 10;
+        GuiCheckBox((Rectangle){ (float)sX, (float)sY, 15, 15 }, "Show Grid Cells", &cfg.show_grid);
+        sY += space;
+        GuiCheckBox((Rectangle){ (float)sX, (float)sY, 15, 15 }, "Show Vision (followed boid)", &cfg.show_vision);
+        sY += space;
+        GuiCheckBox((Rectangle){ (float)sX, (float)sY, 15, 15 }, "Show World Bounds", &cfg.show_world_bounds);
+        sY += space;
+        GuiCheckBox((Rectangle){ (float)sX, (float)sY, 15, 15 }, "Show FPS", &cfg.show_fps);
+        sY += space;
+        GuiCheckBox((Rectangle){ (float)sX, (float)sY, 15, 15 }, "Show Crosshair", &cfg.show_crosshair);
+        sY += space;
+        bool prev_heatmap = cfg.show_speed_heatmap;
+        GuiCheckBox((Rectangle){ (float)sX, (float)sY, 15, 15 }, "Speed Heatmap", &cfg.show_speed_heatmap);
+        // en pausa las matrices no se recalculan, hay que forzar el refresco del color
+        if (cfg.show_speed_heatmap != prev_heatmap) transforms_dirty = true;
+
+        // los desplegables se dibujan al final para que sus listas aparezcan por encima del resto de controles
+        if (GuiDropdownBox(obstacleMapDropdownRect, obstacle_map_dropdown_text, &obstacle_map_selected, obstacle_map_edit_mode)) {
+            obstacle_map_edit_mode = !obstacle_map_edit_mode;
+        }
+        if (GuiDropdownBox(presetDropdownRect, preset_dropdown_text, &preset_selected, preset_edit_mode)) {
+            preset_edit_mode = !preset_edit_mode;
+        }
+        if (GuiDropdownBox(snapshotDropdownRect, snapshot_dropdown_text, &snapshot_selected, snapshot_edit_mode)) {
+            snapshot_edit_mode = !snapshot_edit_mode;
+        }
+    }
+
+    if (cfg.show_fps) DrawFPS(10, 10);
+    EndDrawing();
+}
+
+int main() {
     //calculo del coseno del angulo muerto
     cfg.cos_blind_angle = cosf(PI - cfg.blind_angle);
-
-    // semilla configurable desde la ui
-    int seed = 1;
 
     // semilla aleatoria
     srand(seed);
@@ -1243,90 +2074,60 @@ int main() {
     }
 
     // array dinamico para los boids
-    boid *boids = malloc(sizeof(boid) * cfg.max_boids);
+    boids = malloc(sizeof(boid) * cfg.max_boids);
 
     //check null de la asignacion anterior
     if (boids == NULL) return 1;
-    
 
     //generación inicial de los boids
     boids_init(boids, &cfg);
 
     //generación del grid
-    spatial_grid grid = spatial_grid_init(&cfg);
+    grid = spatial_grid_init(&cfg);
 
     //check null de las reservas del grid
     if (grid.head == NULL || grid.next == NULL) return 1;
 
-    bool show_ui = true;
-    bool is_paused = false;
-    bool seed_edit_mode = false;
+    // hilos para las fases paralelas (OpenMP en nativo, pool de pthreads en web)
+    parallel_init();
 
-    // camara: modo actual, boid seguido y distancia de la vista en tercera persona
-    camera_mode cam_mode = CAM_MODE_FREE;
-    int followed_boid = -1;
-    float follow_distance = 8.0f;
-
-    // carpeta de presets junto al ejecutable
-    char presets_dir[512];
+    // carpetas de presets, snapshots y mapas de obstaculos
+#if defined(PLATFORM_WEB)
+    // en web viven en el sistema de archivos virtual persistente (IndexedDB), ver web/shell.html
+    snprintf(presets_dir, sizeof(presets_dir), "%s/presets", WEB_PERSIST_DIR);
+    snprintf(snapshots_dir, sizeof(snapshots_dir), "%s/snapshots", WEB_PERSIST_DIR);
+    snprintf(obstacles_dir, sizeof(obstacles_dir), "%s/obstacles", WEB_PERSIST_DIR);
+#else
+    // en nativo, junto al ejecutable
     snprintf(presets_dir, sizeof(presets_dir), "%spresets", GetApplicationDirectory());
-    if (!DirectoryExists(presets_dir)) MakeDirectory(presets_dir);
-
-    char preset_names[FILE_LIST_MAX_COUNT][FILE_LIST_MAX_NAME];
-    char preset_dropdown_text[1024];
-    int preset_count = refresh_file_list(presets_dir, ".cfg", preset_names, preset_dropdown_text, sizeof(preset_dropdown_text), "(sin presets)");
-    int preset_selected = 0;
-    bool preset_edit_mode = false;
-    char preset_name_input[FILE_LIST_MAX_NAME] = "";
-    bool preset_name_edit_mode = false;
-
-    // carpeta de snapshots (estado completo de la simulacion) junto al ejecutable
-    char snapshots_dir[512];
     snprintf(snapshots_dir, sizeof(snapshots_dir), "%ssnapshots", GetApplicationDirectory());
-    if (!DirectoryExists(snapshots_dir)) MakeDirectory(snapshots_dir);
-
-    char snapshot_names[FILE_LIST_MAX_COUNT][FILE_LIST_MAX_NAME];
-    char snapshot_dropdown_text[1024];
-    int snapshot_count = refresh_file_list(snapshots_dir, ".snap", snapshot_names, snapshot_dropdown_text, sizeof(snapshot_dropdown_text), "(sin snapshots)");
-    int snapshot_selected = 0;
-    bool snapshot_edit_mode = false;
-    char snapshot_name_input[FILE_LIST_MAX_NAME] = "";
-    bool snapshot_name_edit_mode = false;
-
-    // obstaculos colocados en tiempo real y estado del modo de colocacion
-    obstacle obstacles[MAX_OBSTACLES];
-    int num_obstacles = 0;
-    bool placing_obstacles = false;
-    int place_type = OBSTACLE_SPHERE; // figura seleccionada en el desplegable
-    float place_distance = 40.0f; // distancia de la camara a la superficie mas cercana del fantasma
-    float place_radius = 10.0f;
-    float place_yaw = 0.0f;
-    float place_pitch = 0.0f;
-
-    // carpeta de mapas de obstaculos junto al ejecutable
-    char obstacles_dir[512];
     snprintf(obstacles_dir, sizeof(obstacles_dir), "%sobstacles", GetApplicationDirectory());
+#endif
+    if (!DirectoryExists(presets_dir)) MakeDirectory(presets_dir);
+    if (!DirectoryExists(snapshots_dir)) MakeDirectory(snapshots_dir);
     if (!DirectoryExists(obstacles_dir)) MakeDirectory(obstacles_dir);
 
-    char obstacle_map_names[FILE_LIST_MAX_COUNT][FILE_LIST_MAX_NAME];
-    char obstacle_map_dropdown_text[1024];
-    int obstacle_map_count = refresh_file_list(obstacles_dir, ".obs", obstacle_map_names, obstacle_map_dropdown_text, sizeof(obstacle_map_dropdown_text), "(sin mapas)");
-    int obstacle_map_selected = 0;
-    bool obstacle_map_edit_mode = false;
-    char obstacle_map_name_input[FILE_LIST_MAX_NAME] = "";
-    bool obstacle_map_name_edit_mode = false;
+#if defined(PLATFORM_WEB)
+    // los ejemplos empaquetados en la web se copian al almacenamiento persistente la primera vez
+    web_copy_bundled(WEB_BUNDLED_DIR "/presets", presets_dir, ".cfg");
+    web_copy_bundled(WEB_BUNDLED_DIR "/obstacles", obstacles_dir, ".obs");
+    storage_sync();
+#endif
 
-    // paso y reloj de la simulación fijos, para que no dependan del framerate real y sea reproducible
-    const float sim_dt = 1.0f / 60.0f;
-    float sim_time = 0.0f;
+    preset_count = refresh_file_list(presets_dir, ".cfg", preset_names, preset_dropdown_text, sizeof(preset_dropdown_text), "(sin presets)");
+    snapshot_count = refresh_file_list(snapshots_dir, ".snap", snapshot_names, snapshot_dropdown_text, sizeof(snapshot_dropdown_text), "(sin snapshots)");
+    obstacle_map_count = refresh_file_list(obstacles_dir, ".obs", obstacle_map_names, obstacle_map_dropdown_text, sizeof(obstacle_map_dropdown_text), "(sin mapas)");
 
-    // cache de render: las matrices solo se recalculan si la simulacion avanza o cambia la vista
-    int visible_boids = 0;
-    int prev_num_boids = -1;
-    bool transforms_dirty = true;
-
+#if defined(PLATFORM_WEB)
+    // el canvas ocupa todo el viewport del navegador y se redimensiona con el (FLAG_WINDOW_RESIZABLE)
+    SetConfigFlags(FLAG_WINDOW_RESIZABLE);
+    InitWindow(EM_ASM_INT({ return window.innerWidth; }), EM_ASM_INT({ return window.innerHeight; }), "Boids 3D");
+    // sin SetTargetFPS: el navegador ya sincroniza con el monitor (requestAnimationFrame) y raylib esperaria con un bucle activo
+#else
     InitWindow(1920, 1080, "Boids 3D");
     SetTargetFPS(60);
+#endif
+
 
     //estilos para la ui
 
@@ -1353,22 +2154,21 @@ int main() {
     else DisableCursor();
 
     //creo un cono para un boid
-    Mesh boidMesh = GenMeshCone(0.18f, 0.6f, 8);
+    boidMesh = GenMeshCone(0.18f, 0.6f, 8);
 
     // mallas unitarias de los obstaculos (radio 1, escaladas al dibujar)
-    Mesh obstacleMeshes[OBSTACLE_TYPE_COUNT];
     obstacleMeshes[OBSTACLE_SPHERE] = GenMeshSphere(1.0f, 8, 16);
     obstacleMeshes[OBSTACLE_BOX] = GenMeshCube(2.0f, 2.0f, 2.0f);
     obstacleMeshes[OBSTACLE_TORUS] = GenMeshTorus(TORUS_TUBE_RATIO, 2.0f, 16, 24);
     obstacleMeshes[OBSTACLE_CYLINDER] = GenMeshCylinder(1.0f, 2.0f, 16);
-    Material obstacleMaterial = LoadMaterialDefault();
+    obstacleMaterial = LoadMaterialDefault();
 
     //asigno material y pinto de azul
-    Material boidMaterial = LoadMaterialDefault();
+    boidMaterial = LoadMaterialDefault();
     boidMaterial.maps[MATERIAL_MAP_ALBEDO].color = SKYBLUE;
 
     //shader para visualizacion de los boids
-    Shader shader = LoadShaderFromMemory(instancingVS, instancingFS);
+    shader = LoadShaderFromMemory(instancingVS, instancingFS);
 
     shader.locs[SHADER_LOC_MATRIX_MVP] = GetShaderLocation(shader, "mvp");
     shader.locs[SHADER_LOC_MATRIX_MODEL] = GetShaderLocationAttrib(shader, "instanceTransform");
@@ -1376,7 +2176,7 @@ int main() {
     boidMaterial.shader = shader;
 
     //reserva de memoria
-    Matrix *boidTransforms = malloc(sizeof(Matrix) * cfg.max_boids);
+    boidTransforms = malloc(sizeof(Matrix) * cfg.max_boids);
 
     //check null de la asignacion anterior
     if (boidTransforms == NULL) {
@@ -1384,497 +2184,18 @@ int main() {
         return 1;
     }
 
-    Camera3D camera = {0};
     camera.position = (Vector3){cfg.world_size+10.0f, cfg.world_size+10.0f, cfg.world_size+10.0f};
     camera.target = (Vector3){0.0f, 0.0f, 0.0f};
     camera.up = (Vector3){0.0f, 1.0f, 0.0f};
     camera.fovy = 45.0f;
-    camera.projection = CAMERA_PERSPECTIVE; 
-
-    while (!WindowShouldClose()) {
-        float dt = GetFrameTime();
-
-        // mientras se edita un campo de texto, el teclado no debe disparar atajos ni mover la camara
-        bool typing = seed_edit_mode || preset_name_edit_mode || snapshot_name_edit_mode || obstacle_map_name_edit_mode;
-
-        if (!typing) simulation_handle_input(&cfg, &is_paused);
-
-        // reinicio rápido de la simulación (deshabilitado mientras se edita algun campo de texto)
-        if (IsKeyPressed(KEY_R) && !typing) {
-            boids_reset(boids, &cfg, seed, &sim_time);
-            transforms_dirty = true;
-        }
-
-        // alternar modo de camara
-        if (IsKeyPressed(KEY_C) && !typing) {
-            camera_mode_cycle(&cam_mode, &followed_boid, cfg.num_boids);
-            transforms_dirty = true;
-        }
-
-        // alternar modo de colocacion de obstaculos
-        if (IsKeyPressed(KEY_O) && !typing) placing_obstacles = !placing_obstacles;
-
-        // si el boid seguido deja de existir (slider de num boids o carga de snapshot), volver a camara libre
-        if (followed_boid >= cfg.num_boids) {
-            followed_boid = -1;
-            cam_mode = CAM_MODE_FREE;
-        }
-
-        bool following = (cam_mode != CAM_MODE_FREE && followed_boid >= 0);
-
-        //UpdateCamera(&camera, CAMERA_FREE); //camara antes
-        //velocidad de la camara
-        float base_speed = 150.0f;
-        
-        // Sprint al mantener Control
-        if (IsKeyDown(KEY_LEFT_CONTROL)) base_speed *= 3.0f; 
-        
-        float cam_speed = base_speed * dt;
-
-        Vector3 movement = {0};
-        if (!typing) {
-            if (IsKeyDown(KEY_W)) movement.x += cam_speed;
-            if (IsKeyDown(KEY_S)) movement.x -= cam_speed;
-            if (IsKeyDown(KEY_D)) movement.y += cam_speed;
-            if (IsKeyDown(KEY_A)) movement.y -= cam_speed;
-
-            // espacio y shift para subir y bajar
-            if (IsKeyDown(KEY_SPACE)) movement.z += cam_speed;
-            if (IsKeyDown(KEY_LEFT_SHIFT)) movement.z -= cam_speed;
-        }
-
-        // desactivar ui
-        if (IsKeyPressed(KEY_TAB) && !typing) {
-            show_ui = !show_ui;
-            if (show_ui) EnableCursor();
-            else DisableCursor();
-        }
-
-        // pantalla completa (ventana sin bordes a resolucion del monitor)
-        if (IsKeyPressed(KEY_F11)) ToggleBorderlessWindowed();
-
-        // rotación con el ratón (solo si la ui esta oculta)
-        Vector3 rotation = {0};
-        if (!show_ui) {
-            Vector2 mouseDelta = GetMouseDelta();
-            rotation.x = mouseDelta.x * 0.1f;
-            rotation.y = mouseDelta.y * 0.1f;
-        }
-
-        // zoom con la rueda
-        float zoom = GetMouseWheelMove() * 2.0f;
-
-        // punto de apuntado compartido por seleccion de boids y colocacion de obstaculos:
-        // con la ui visible es el cursor (fuera del panel), con la ui oculta el centro de la pantalla
-        Vector2 aim = { GetScreenWidth() * 0.5f, GetScreenHeight() * 0.5f };
-        bool aim_valid = true;
-
-        if (show_ui) {
-            aim = GetMousePosition();
-            Rectangle panel_rect = { (float)(GetScreenWidth() - UI_PANEL_WIDTH - 10), 10.0f, (float)UI_PANEL_WIDTH, (float)UI_PANEL_HEIGHT };
-            aim_valid = !CheckCollisionPointRec(aim, panel_rect);
-        }
-
-        // en modo colocacion la rueda ajusta la distancia del fantasma en lugar del zoom de camara
-        if (placing_obstacles) {
-            place_distance = clamp_float(place_distance + zoom * 2.5f, 5.0f, 300.0f);
-            zoom = 0.0f;
-
-            // flechas para rotar la figura antes de colocarla
-            if (!typing) {
-                float rot = 1.5f * dt;
-                if (IsKeyDown(KEY_RIGHT)) place_yaw += rot;
-                if (IsKeyDown(KEY_LEFT)) place_yaw -= rot;
-                if (IsKeyDown(KEY_UP)) place_pitch += rot;
-                if (IsKeyDown(KEY_DOWN)) place_pitch -= rot;
-                if (place_yaw > PI) place_yaw -= 2.0f * PI; else if (place_yaw < -PI) place_yaw += 2.0f * PI;
-                if (place_pitch > PI) place_pitch -= 2.0f * PI; else if (place_pitch < -PI) place_pitch += 2.0f * PI;
-            }
-        }
-
-        Ray aim_ray = GetScreenToWorldRay(aim, camera);
-        // el fantasma se proyecta por delante de la camara: la distancia se mide hasta su superficie, no a su centro
-        obstacle ghost = { (obstacle_type)place_type, {0.0f, 0.0f, 0.0f}, place_radius, place_yaw, place_pitch };
-        float ghost_dist = place_distance + obstacle_bounding_radius(&ghost);
-        ghost.position = (vec3){
-            aim_ray.position.x + aim_ray.direction.x * ghost_dist,
-            aim_ray.position.y + aim_ray.direction.y * ghost_dist,
-            aim_ray.position.z + aim_ray.direction.z * ghost_dist
-        };
-
-        if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && aim_valid) {
-            if (placing_obstacles) {
-                if (num_obstacles < MAX_OBSTACLES) obstacles[num_obstacles++] = ghost;
-            } else {
-                int picked = boid_pick_from_ray(aim_ray, boids, cfg.num_boids);
-                if (picked >= 0) {
-                    followed_boid = picked;
-                    if (cam_mode == CAM_MODE_FREE) cam_mode = CAM_MODE_THIRD_PERSON;
-                    following = true;
-                    transforms_dirty = true;
-                }
-            }
-        }
-
-        // clic derecho en modo colocacion: borrar el obstaculo apuntado
-        if (IsMouseButtonPressed(MOUSE_BUTTON_RIGHT) && placing_obstacles && aim_valid) {
-            int picked = obstacle_pick_from_ray(aim_ray, obstacles, num_obstacles);
-            if (picked >= 0) obstacles[picked] = obstacles[--num_obstacles];
-        }
-
-        if (!following) {
-            camera.up = (Vector3){0.0f, 1.0f, 0.0f};
-            // zoom negado: para UpdateCameraPro positivo aleja, pero rueda hacia delante debe acercar
-            UpdateCameraPro(&camera, movement, rotation, -zoom);
-        } else {
-            // en modo seguimiento la rueda ajusta la distancia de la tercera persona
-            follow_distance = clamp_float(follow_distance - zoom, 2.0f, 60.0f);
-        }
-
-        if (!is_paused) {
-            //rellenar grid
-            grid_build(&grid, boids, &cfg);
-            //avanzar el reloj de simulación con un paso fijo (no el tiempo real de reloj)
-            sim_time += sim_dt;
-            //calculo de reglas (separacion, alineacion, cohesion)
-            boids_compute_accelerations(boids, &cfg, &grid, obstacles, num_obstacles, sim_time);
-            //actualizacion de boids
-            boids_update(boids, &cfg, obstacles, num_obstacles, sim_dt);
-        }
-
-        // la camara se pega al boid despues de moverlo para no ir un frame por detras
-        if (following) camera_follow_boid(&camera, &boids[followed_boid], cam_mode, follow_distance);
-
-        // solo se recalculan matrices si los boids se han movido o la vista ha cambiado
-        bool camera_moved = (movement.x != 0.0f) || (movement.y != 0.0f) || (movement.z != 0.0f)
-                         || (rotation.x != 0.0f) || (rotation.y != 0.0f) || (zoom != 0.0f) || IsWindowResized();
-
-        if (!is_paused || camera_moved || cfg.num_boids != prev_num_boids || transforms_dirty) {
-            // planos del frustum para descartar los boids que la camara no ve
-            Matrix view = GetCameraMatrix(camera);
-            float aspect = (float)GetScreenWidth() / (float)GetScreenHeight();
-            Matrix proj = MatrixPerspective(camera.fovy * DEG2RAD, aspect, CAMERA_NEAR_PLANE, CAMERA_FAR_PLANE);
-            frustum fr = frustum_from_view_projection(MatrixMultiply(view, proj));
-
-            visible_boids = 0;
-
-            #pragma omp parallel for
-            for (int i = 0; i < cfg.num_boids; i++) {
-                boid *b = &boids[i];
-
-                // en primera persona el boid seguido no se dibuja para no tapar la vista
-                if (cam_mode == CAM_MODE_FIRST_PERSON && i == followed_boid) continue;
-
-                if (!frustum_contains_sphere(&fr, b->position, BOID_BOUNDING_RADIUS)) continue;
-
-                //la dirección en la que vuela el boid normalizada (la longitud se reutiliza para el heatmap)
-                float speed = sqrtf(vec3_length2(b->velocity));
-                vec3 dir = (speed > 0.0f) ? vec3_scale(b->velocity, 1.0f / speed) : (vec3){0.0f, 0.0f, 0.0f};
-                Matrix transform = boid_transform(b->position, dir);
-
-                // color por instancia inyectado en la fila libre de la matriz (m3, m7, m11)
-                vec3 color = BOID_BASE_COLOR;
-                if (cfg.show_speed_heatmap) {
-                    float t = (speed - cfg.min_speed) / fmaxf(cfg.max_speed - cfg.min_speed, 0.001f);
-                    color = speed_heatmap_color(clamp_float(t, 0.0f, 1.0f));
-                }
-                transform.m3 = color.x;
-                transform.m7 = color.y;
-                transform.m11 = color.z;
-
-                //reservar hueco en el array compactado de boids visibles
-                int slot;
-                #pragma omp atomic capture
-                slot = visible_boids++;
-
-                boidTransforms[slot] = transform;
-            }
-
-            prev_num_boids = cfg.num_boids;
-            transforms_dirty = false;
-        }
-
-        BeginDrawing();
-        ClearBackground((Color){20, 22, 28, 255});
-
-        BeginMode3D(camera);
-
-        // dibujar el suelo y los limites del mundo
-        //DrawGrid(20, 1.0f);
-        if (cfg.show_world_bounds) {
-            DrawCubeWires(
-                (Vector3){0.0f, 0.0f, 0.0f},
-                cfg.world_size * 2.0f,
-                cfg.world_size * 2.0f,
-                cfg.world_size * 2.0f,
-                GRAY
-            );
-        }
-
-        //dibujado directo de los boids visibles
-        if (visible_boids > 0) DrawMeshInstanced(boidMesh, boidMaterial, boidTransforms, visible_boids);
-
-        // obstaculos activos: relleno translucido mas pasada en alambre para perfilar la figura
-        for (int i = 0; i < num_obstacles; i++) {
-            Matrix obs_transform = obstacle_draw_transform(&obstacles[i]);
-            obstacleMaterial.maps[MATERIAL_MAP_ALBEDO].color = Fade(OBSTACLE_COLOR, 0.35f);
-            DrawMesh(obstacleMeshes[obstacles[i].type], obstacleMaterial, obs_transform);
-            rlEnableWireMode();
-            obstacleMaterial.maps[MATERIAL_MAP_ALBEDO].color = Fade(OBSTACLE_COLOR, 0.8f);
-            DrawMesh(obstacleMeshes[obstacles[i].type], obstacleMaterial, obs_transform);
-            rlDisableWireMode();
-        }
-
-        // fantasma de previsualizacion del obstaculo a colocar
-        if (placing_obstacles && aim_valid && num_obstacles < MAX_OBSTACLES) {
-            rlEnableWireMode();
-            obstacleMaterial.maps[MATERIAL_MAP_ALBEDO].color = Fade(GREEN, 0.6f);
-            DrawMesh(obstacleMeshes[ghost.type], obstacleMaterial, obstacle_draw_transform(&ghost));
-            rlDisableWireMode();
-        }
-
-        // overlays de debug: celdas ocupadas del grid y vision del boid seguido
-        if (cfg.show_grid) debug_draw_grid(&grid);
-        if (cfg.show_vision && followed_boid >= 0 && followed_boid < cfg.num_boids) {
-            debug_draw_vision(&boids[followed_boid], &cfg);
-        }
-
-        EndMode3D();
-
-        // mirilla de referencia para seleccionar boids con la ui oculta
-        if (!show_ui && cfg.show_crosshair) {
-            int cx = GetScreenWidth() / 2;
-            int cy = GetScreenHeight() / 2;
-            DrawLine(cx - 8, cy, cx + 8, cy, Fade(RAYWHITE, 0.7f));
-            DrawLine(cx, cy - 8, cx, cy + 8, Fade(RAYWHITE, 0.7f));
-        }
-
-        // recordatorio de controles del modo colocacion
-        if (placing_obstacles) {
-            DrawText(TextFormat("Colocar: clic izq  |  Borrar: clic dcho  |  Rueda: distancia %.0f  |  Flechas: rotar (yaw %.0f, pitch %.0f)",
-                     place_distance, place_yaw * RAD2DEG, place_pitch * RAD2DEG),
-                     10, GetScreenHeight() - 30, 20, RAYWHITE);
-        }
-
-        if (show_ui) {
-            int pW = UI_PANEL_WIDTH;
-            int pH = UI_PANEL_HEIGHT;
-            
-            // Ancho total de pantalla, menos el ancho del panel, menos 10 píxeles de margen
-            int pX = GetScreenWidth() - pW - 10; 
-            int pY = 10; // Pegado arriba
-            
-            GuiPanel((Rectangle){ (float)pX, (float)pY, (float)pW, (float)pH }, "Parameters (TAB to fly)");
-
-            // Coordenadas base para los sliders relativas al panel
-            int sX = pX + 110;
-            int sY = pY + 40;
-            int sW = 160;
-            int sH = 15;
-            int space = 26;
-
-            // ancho de fila para los controles con boton lateral (nombre/desplegable + Save/Load), alineado con el resto de la ui
-            int rowGap = 10;
-            int rowBtnW = 55;
-            int rowFieldW = sW + 10 - rowGap - rowBtnW;
-
-            // Número de Boids
-            float active_boids = (float)cfg.num_boids;
-            GuiSliderBar((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH }, "Num Boids", TextFormat("%d", cfg.num_boids), &active_boids, 100.0f, (float)cfg.max_boids);
-            cfg.num_boids = (int)active_boids;
-
-            // Tamaño del Mundo
-            sY += space;
-            GuiSliderBar((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH }, "World Size", TextFormat("%.0f", cfg.world_size), &cfg.world_size, 50.0f, 400.0f);
-
-            // Comportamiento de los boids
-            sY += space;
-            GuiSliderBar((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH }, "Min Speed", TextFormat("%.1f", cfg.min_speed), &cfg.min_speed, 1.0f, 20.0f);
-
-            sY += space;
-            GuiSliderBar((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH }, "Max Speed", TextFormat("%.1f", cfg.max_speed), &cfg.max_speed, 10.0f, 50.0f);
-
-            sY += space;
-            GuiSliderBar((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH }, "Vision Radius", TextFormat("%.1f", cfg.vision_radius), &cfg.vision_radius, 1.0f, 50.0f);
-            
-            sY += space;
-            GuiSliderBar((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH }, "Blind Angle", TextFormat("%.2f rad", cfg.blind_angle), &cfg.blind_angle, 0.0f, PI);
-            cfg.cos_blind_angle = cosf(PI - cfg.blind_angle); 
-
-            sY += space;
-            GuiSliderBar((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH }, "Separation", TextFormat("%.2f", cfg.separation_weight), &cfg.separation_weight, 0.0f, 2.0f);
-            
-            sY += space;
-            GuiSliderBar((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH }, "Alignment", TextFormat("%.2f", cfg.alignment_weight), &cfg.alignment_weight, 0.0f, 2.0f);
-            
-            sY += space;
-            GuiSliderBar((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH }, "Cohesion", TextFormat("%.2f", cfg.cohesion_weight), &cfg.cohesion_weight, 0.0f, 2.0f);
-            
-            sY += space;
-            GuiSliderBar((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH }, "Wander", TextFormat("%.2f", cfg.wander_weight), &cfg.wander_weight, 0.0f, 1.0f);
-            
-            sY += space;
-            GuiSliderBar((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH }, "Urgency", TextFormat("%.2f", cfg.urgency_multiplier), &cfg.urgency_multiplier, 0.01f, 1.0f);
-            
-            sY += space;
-            GuiSliderBar((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH }, "Agility", TextFormat("%.1f", cfg.agility), &cfg.agility, 0.1f, 10.0f);
-
-            sY += space;
-            GuiSliderBar((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH }, "Avoidance", TextFormat("%.2f", cfg.avoid_weight), &cfg.avoid_weight, 0.0f, 3.0f);
-
-            // Comportamiento de bordes: BOUNCE -> WRAP -> STEER (evasion suave)
-            sY += space;
-            if (GuiButton((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH }, TextFormat("Boundary: %s (B)", boundary_mode_to_string(cfg.boundary_mode)))) {
-                cfg.boundary_mode = (cfg.boundary_mode + 1) % 3;
-            }
-
-            // pausar/reanudar la simulacion
-            sY += space;
-            GuiCheckBox((Rectangle){ (float)sX, (float)sY, 15, 15 }, "Paused (P to toggle)", &is_paused);
-
-            // semilla del rng
-            sY += space;
-            if (GuiValueBox((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH }, "Seed", &seed, 0, 999999, seed_edit_mode)) {
-                seed_edit_mode = !seed_edit_mode;
-            }
-
-            // reset de la simulacion con la semilla actual
-            sY += space;
-            if (GuiButton((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH + 10 }, "Reset Simulation (R)")) {
-                boids_reset(boids, &cfg, seed, &sim_time);
-                transforms_dirty = true;
-            }
-
-            // alternar modo de camara (libre / 1a persona / 3a persona)
-            sY += space;
-            const char *cam_label = (cam_mode == CAM_MODE_FREE) ? "Camera: Free (C)"
-                                  : (cam_mode == CAM_MODE_FIRST_PERSON) ? TextFormat("Camera: 1st #%d (C)", followed_boid)
-                                  : TextFormat("Camera: 3rd #%d (C)", followed_boid);
-            if (GuiButton((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH + 10 }, cam_label)) {
-                camera_mode_cycle(&cam_mode, &followed_boid, cfg.num_boids);
-                transforms_dirty = true;
-            }
-
-            // elegir un boid aleatorio a seguir (tambien se puede clicar un boid en el mundo)
-            sY += space + 10;
-            if (GuiButton((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH + 10 }, "Follow Random Boid") && cfg.num_boids > 0) {
-                followed_boid = rand() % cfg.num_boids;
-                if (cam_mode == CAM_MODE_FREE) cam_mode = CAM_MODE_THIRD_PERSON;
-                transforms_dirty = true;
-            }
-
-            // nombre bajo el que se guardara la config actual como preset, con su boton de guardado al lado
-            sY += space + 10;
-            GuiLine((Rectangle){ (float)(pX + 10), (float)(sY - 8), (float)(pW - 20), 10 }, "Preset");
-            sY += space - 10;
-            if (GuiTextBox((Rectangle){ (float)sX, (float)sY, (float)rowFieldW, (float)sH }, preset_name_input, FILE_LIST_MAX_NAME, preset_name_edit_mode)) {
-                preset_name_edit_mode = !preset_name_edit_mode;
-            }
-            if (GuiButton((Rectangle){ (float)(sX + rowFieldW + rowGap), (float)sY, (float)rowBtnW, (float)sH }, "Save") && preset_name_input[0] != '\0') {
-                char filepath[600];
-                snprintf(filepath, sizeof(filepath), "%s/%s.cfg", presets_dir, preset_name_input);
-                config_save_preset(&cfg, filepath);
-                preset_count = refresh_file_list(presets_dir, ".cfg", preset_names, preset_dropdown_text, sizeof(preset_dropdown_text), "(sin presets)");
-                if (preset_selected >= preset_count) preset_selected = (preset_count > 0) ? preset_count - 1 : 0;
-            }
-
-            // desplegable de presets guardados, con su boton de carga al lado
-            sY += space;
-            Rectangle presetDropdownRect = { (float)sX, (float)sY, (float)rowFieldW, (float)sH };
-            if (GuiButton((Rectangle){ (float)(sX + rowFieldW + rowGap), (float)sY, (float)rowBtnW, (float)sH }, "Load") && preset_count > 0) {
-                char filepath[600];
-                snprintf(filepath, sizeof(filepath), "%s/%s.cfg", presets_dir, preset_names[preset_selected]);
-                config_load_preset(&cfg, filepath);
-            }
-
-            // snapshots: guardan la config y la posicion/velocidad/aceleracion de todos los boids con nombre propio para retomar la simulacion despues
-            sY += space + 10;
-            GuiLine((Rectangle){ (float)(pX + 10), (float)(sY - 8), (float)(pW - 20), 10 }, "Snapshot");
-            sY += space - 10;
-            if (GuiTextBox((Rectangle){ (float)sX, (float)sY, (float)rowFieldW, (float)sH }, snapshot_name_input, FILE_LIST_MAX_NAME, snapshot_name_edit_mode)) {
-                snapshot_name_edit_mode = !snapshot_name_edit_mode;
-            }
-            if (GuiButton((Rectangle){ (float)(sX + rowFieldW + rowGap), (float)sY, (float)rowBtnW, (float)sH }, "Save") && snapshot_name_input[0] != '\0') {
-                char filepath[600];
-                snprintf(filepath, sizeof(filepath), "%s/%s.snap", snapshots_dir, snapshot_name_input);
-                boids_save_state(boids, &cfg, obstacles, num_obstacles, sim_time, filepath);
-                snapshot_count = refresh_file_list(snapshots_dir, ".snap", snapshot_names, snapshot_dropdown_text, sizeof(snapshot_dropdown_text), "(sin snapshots)");
-                if (snapshot_selected >= snapshot_count) snapshot_selected = (snapshot_count > 0) ? snapshot_count - 1 : 0;
-            }
-
-            sY += space;
-            Rectangle snapshotDropdownRect = { (float)sX, (float)sY, (float)rowFieldW, (float)sH };
-            if (GuiButton((Rectangle){ (float)(sX + rowFieldW + rowGap), (float)sY, (float)rowBtnW, (float)sH }, "Load") && snapshot_count > 0) {
-                char filepath[600];
-                snprintf(filepath, sizeof(filepath), "%s/%s.snap", snapshots_dir, snapshot_names[snapshot_selected]);
-                if (boids_load_state(boids, &cfg, &sim_time, obstacles, &num_obstacles, filepath)) transforms_dirty = true;
-            }
-
-            // obstaculos: modo de colocacion con el raton, radio y mapas guardables por separado
-            sY += space + 10;
-            GuiLine((Rectangle){ (float)(pX + 10), (float)(sY - 8), (float)(pW - 20), 10 }, "Obstacles");
-            sY += space - 10;
-            GuiCheckBox((Rectangle){ (float)sX, (float)sY, 15, 15 }, TextFormat("Place mode (O)  %d/%d", num_obstacles, MAX_OBSTACLES), &placing_obstacles);
-            sY += space;
-            GuiComboBox((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH }, "Sphere;Cube;Donut;Cylinder", &place_type);
-            sY += space;
-            GuiSliderBar((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH }, "Radius", TextFormat("%.1f", place_radius), &place_radius, 1.0f, 50.0f);
-            sY += space;
-            if (GuiButton((Rectangle){ (float)sX, (float)sY, (float)sW, (float)sH }, "Clear Obstacles")) num_obstacles = 0;
-            sY += space;
-            if (GuiTextBox((Rectangle){ (float)sX, (float)sY, (float)rowFieldW, (float)sH }, obstacle_map_name_input, FILE_LIST_MAX_NAME, obstacle_map_name_edit_mode)) {
-                obstacle_map_name_edit_mode = !obstacle_map_name_edit_mode;
-            }
-            if (GuiButton((Rectangle){ (float)(sX + rowFieldW + rowGap), (float)sY, (float)rowBtnW, (float)sH }, "Save") && obstacle_map_name_input[0] != '\0') {
-                char filepath[600];
-                snprintf(filepath, sizeof(filepath), "%s/%s.obs", obstacles_dir, obstacle_map_name_input);
-                obstacles_save_map(obstacles, num_obstacles, filepath);
-                obstacle_map_count = refresh_file_list(obstacles_dir, ".obs", obstacle_map_names, obstacle_map_dropdown_text, sizeof(obstacle_map_dropdown_text), "(sin mapas)");
-                if (obstacle_map_selected >= obstacle_map_count) obstacle_map_selected = (obstacle_map_count > 0) ? obstacle_map_count - 1 : 0;
-            }
-
-            sY += space;
-            Rectangle obstacleMapDropdownRect = { (float)sX, (float)sY, (float)rowFieldW, (float)sH };
-            if (GuiButton((Rectangle){ (float)(sX + rowFieldW + rowGap), (float)sY, (float)rowBtnW, (float)sH }, "Load") && obstacle_map_count > 0) {
-                char filepath[600];
-                snprintf(filepath, sizeof(filepath), "%s/%s.obs", obstacles_dir, obstacle_map_names[obstacle_map_selected]);
-                obstacles_load_map(obstacles, &num_obstacles, filepath);
-            }
-
-            // seccion de debug: overlays de visualizacion en tiempo real
-            sY += space + 10;
-            GuiLine((Rectangle){ (float)(pX + 10), (float)(sY - 8), (float)(pW - 20), 10 }, "Debug");
-            sY += space - 10;
-            GuiCheckBox((Rectangle){ (float)sX, (float)sY, 15, 15 }, "Show Grid Cells", &cfg.show_grid);
-            sY += space;
-            GuiCheckBox((Rectangle){ (float)sX, (float)sY, 15, 15 }, "Show Vision (followed boid)", &cfg.show_vision);
-            sY += space;
-            GuiCheckBox((Rectangle){ (float)sX, (float)sY, 15, 15 }, "Show World Bounds", &cfg.show_world_bounds);
-            sY += space;
-            GuiCheckBox((Rectangle){ (float)sX, (float)sY, 15, 15 }, "Show FPS", &cfg.show_fps);
-            sY += space;
-            GuiCheckBox((Rectangle){ (float)sX, (float)sY, 15, 15 }, "Show Crosshair", &cfg.show_crosshair);
-            sY += space;
-            bool prev_heatmap = cfg.show_speed_heatmap;
-            GuiCheckBox((Rectangle){ (float)sX, (float)sY, 15, 15 }, "Speed Heatmap", &cfg.show_speed_heatmap);
-            // en pausa las matrices no se recalculan, hay que forzar el refresco del color
-            if (cfg.show_speed_heatmap != prev_heatmap) transforms_dirty = true;
-
-            // los desplegables se dibujan al final para que sus listas aparezcan por encima del resto de controles
-            if (GuiDropdownBox(obstacleMapDropdownRect, obstacle_map_dropdown_text, &obstacle_map_selected, obstacle_map_edit_mode)) {
-                obstacle_map_edit_mode = !obstacle_map_edit_mode;
-            }
-            if (GuiDropdownBox(presetDropdownRect, preset_dropdown_text, &preset_selected, preset_edit_mode)) {
-                preset_edit_mode = !preset_edit_mode;
-            }
-            if (GuiDropdownBox(snapshotDropdownRect, snapshot_dropdown_text, &snapshot_selected, snapshot_edit_mode)) {
-                snapshot_edit_mode = !snapshot_edit_mode;
-            }
-        }
-
-        if (cfg.show_fps) DrawFPS(10, 10);
-        EndDrawing();
-    }
+    camera.projection = CAMERA_PERSPECTIVE;
+
+#if defined(PLATFORM_WEB)
+    // el navegador llama a update_draw_frame en cada requestAnimationFrame; esta llamada no retorna
+    emscripten_set_main_loop(update_draw_frame, 0, 1);
+#else
+    while (!WindowShouldClose()) update_draw_frame();
+#endif
 
     CloseWindow();
 
