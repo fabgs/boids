@@ -134,6 +134,7 @@ build_web.sh   # Web (WebAssembly) build script, bash
 web/           # HTML shell, coi-serviceworker.js and a local dev server with COOP/COEP headers
 .github/       # GitHub Actions workflow that builds and deploys the web version to Pages
 LICENSE        # MIT
+NOTICE         # Third-party components and their licenses
 ```
 
 ## Technical Highlights
@@ -145,4 +146,4 @@ LICENSE        # MIT
 
 ## License
 
-MIT, see [LICENSE](LICENSE). Made by [Fabián Godoy](https://fabgs.dev/) ([@fabgs](https://github.com/fabgs)).
+MIT, see [LICENSE](LICENSE). The bundled raylib, raygui and coi-serviceworker keep their own licenses, listed in [NOTICE](NOTICE). Made by [Fabián Godoy](https://fabgs.dev/) ([@fabgs](https://github.com/fabgs)).

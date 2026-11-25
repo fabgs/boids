@@ -1,0 +1,25 @@
+Boids 3D
+Copyright (c) 2026 Fabián Godoy Silvestre
+
+The code in this repository is released under the MIT License (see LICENSE),
+except for the third-party components listed below, which keep their own
+licenses.
+
+raylib 6.0
+  Files: include/raylib.h, include/raymath.h, include/rlgl.h, lib/
+  Copyright (c) 2013-2026 Ramon Santamaria (@raysan5)
+  License: zlib/libpng (https://github.com/raysan5/raylib)
+
+raygui 5.0
+  Files: include/raygui.h
+  Copyright (c) 2014-2026 Ramon Santamaria (@raysan5)
+  License: zlib/libpng (https://github.com/raysan5/raygui)
+
+coi-serviceworker 0.1.7
+  Files: web/coi-serviceworker.js
+  Copyright (c) Guido Zuidhof and contributors
+  License: MIT (https://github.com/gzuidhof/coi-serviceworker)
+
+The WebAssembly build published at https://fabgs.dev/boids/ is compiled with
+Emscripten and includes its runtime, released under the MIT and University of
+Illinois/NCSA licenses (https://github.com/emscripten-core/emscripten).
